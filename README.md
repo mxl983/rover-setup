@@ -1,0 +1,95 @@
+# Raspberry Pi — Rover BLE Daemon
+
+**Required for BLE setup.** Without this daemon, the ESP never sees a BLE
+`HEARTBEAT` / `NODE_READY` and phone setup stalls after powering the Pi.
+
+**Customer path (zero manual network work):** factory flash runs `install.sh`
+once → daemon + Bluetooth + `tailscaled` + NetworkManager on every boot → phone
+BLE setup sends Wi‑Fi + auth key over GATT → Pi joins Wi‑Fi, joins Tailscale,
+and stays online across reboots. Later ESP `WIPE_NET` / `WIFI_CONFIG` /
+`WIPE_ALL` are always accepted while the daemon is running.
+
+Always-on companion for the ESP32 portal:
+
+1. Boot → advertise BLE **`J2-Pi`** → send `HEARTBEAT`
+2. **IDLE_LISTENING** — normal when no onboarding commands arrive
+3. On `WIPE_NET` + `WIFI_CONFIG` → backup Wi‑Fi, join, then Tailscale auth-key
+   rejoin. Never drops live Wi‑Fi before the new join is proven.
+4. **NORMAL_OPERATION** — periodic heartbeats; issues/renews HTTPS certs for MagicDNS
+5. Idle / manual halt (from `rover-control`): writes `/tmp/esp-sleep.req` →
+   daemon publishes MQTT **`OFF GPIO16 DELAY 15 <wake_secret>`** → OS
+   `poweroff` → ESP cuts rail after the delay
+6. `WIPE_ALL` → factory reset networks + MQTT rail-off + shutdown
+
+MQTT broker creds + `wake_secret` arrive in BLE `WIFI_CONFIG` and are stored at
+`/var/lib/rover/mqtt.json` (0600). `ROVER_MQTT_*` env vars are optional overrides.
+
+HTTPS certs (`tailscale cert`) live at `/var/lib/rover/certs/{cert.crt,cert.key}`.
+Weekly `rover-cert-renew.timer` keeps them fresh.
+
+Setup protocol: **[`BLE_SETUP_PROTOCOL.md`](BLE_SETUP_PROTOCOL.md)**  
+Legacy UART framing reference: [`UART_PROTOCOL.md`](UART_PROTOCOL.md)
+
+## Fresh Pi install (4B & 5)
+
+```bash
+cd /path/to/pi
+sudo ./install.sh
+```
+
+Installs under `/opt/rover-firmware`, enables **Bluetooth**, **tailscaled**, and
+`rover-daemon`. Default transport is **BLE** (`ROVER_TRANSPORT=ble`) — no UART
+wiring required for setup. Keep ESP GPIO16 for Pi power control. MQTT +
+`wake_secret` are provisioned over BLE during phone setup.
+
+**Phase 2 unattended join** (optional):
+
+```bash
+sudo ROVER_TAILSCALE_AUTHKEY=tskey-auth-... \
+     ROVER_TAILSCALE_API_KEY=tskey-api-... \
+     ROVER_TAILSCALE_TAILNET=your.tailnet \
+     ./install.sh
+```
+
+Full walkthrough: **[`INSTALL.md`](INSTALL.md)**.
+
+## Layout
+
+```
+pi/
+  INSTALL.md
+  README.md
+  BLE_SETUP_PROTOCOL.md
+  UART_PROTOCOL.md          # legacy framing reference
+  requirements.txt
+  rover_daemon/             # Python package (ble_gatt, mqtt_rail, daemon)
+  systemd/rover-daemon.service
+```
+
+## Quick reinstall
+
+```bash
+sudo ./install.sh
+sudo journalctl -u rover-daemon -f
+```
+
+## Environment
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ROVER_TRANSPORT` | `ble` | `ble` (default) or legacy `uart` |
+| `ROVER_BLE_NAME` | `J2-Pi` | Must start with `J2-Pi` |
+| `ROVER_MQTT_*` | _(optional)_ | Overrides for values in `/var/lib/rover/mqtt.json` |
+| `ROVER_DRY_RUN` | `0` | Set `1` to skip nmcli/tailscale/shutdown |
+| `ROVER_CERT_DIR` | `/var/lib/rover/certs` | MagicDNS HTTPS cert/key dir |
+| `ROVER_SERIAL` / `ROVER_BAUD` | | Legacy UART only |
+
+## Packages
+
+```bash
+sudo apt install python3-dbus python3-gi bluez   # optional dbus-python; BlueZ required
+# install.sh venv gets: paho-mqtt dbus-next
+# pyserial only if ROVER_TRANSPORT=uart
+```
+
+Vendored copies under `pi/vendor/` are used when the venv cannot install packages.

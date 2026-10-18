@@ -1,0 +1,37 @@
+[Unit]
+Description=J2 Rover BLE daemon (ESP32 companion)
+# Start after networking + Tailscale + Bluetooth so setup + join work at boot.
+After=network-online.target NetworkManager.service tailscaled.service bluetooth.service
+Wants=network-online.target NetworkManager.service tailscaled.service bluetooth.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rover-firmware/pi
+Environment=PYTHONUNBUFFERED=1
+Environment=ROVER_TRANSPORT=ble
+Environment=ROVER_BLE_NAME=J2-Pi
+Environment=ROVER_TAILSCALE_TAG=tag:rover
+Environment=ROVER_CERT_DIR=/var/lib/rover/certs
+Environment=ROVER_CERT_RENEW_WITHIN_DAYS=21
+Environment=PYTHONPATH=/opt/rover-firmware/pi
+# MQTT rail-off (required for idle/factory power cut). Prefer drop-in mqtt.conf:
+# Environment=ROVER_MQTT_HOST=...
+# Environment=ROVER_MQTT_USER=...
+# Environment=ROVER_MQTT_PASS=...
+# Optional: ROVER_MQTT_TOPIC_CMD  ROVER_MQTT_RAIL_OFF=OFF GPIO16
+# Legacy UART only if ROVER_TRANSPORT=uart:
+# Environment=ROVER_SERIAL=/dev/serial0
+# Environment=ROVER_BAUD=115200
+# ExecStartPre=/opt/rover-firmware/pi/scripts/claim_uart.sh
+# Environment=ROVER_DRY_RUN=1
+# Optional factory defaults (phone auth key during BLE setup is preferred):
+# Environment=ROVER_TAILSCALE_AUTHKEY=tskey-auth-...
+# Environment=ROVER_TAILSCALE_API_KEY=tskey-api-...
+# Environment=ROVER_TAILSCALE_TAILNET=your.org.github
+ExecStart=/opt/rover-firmware/venv/bin/python -m rover_daemon
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target

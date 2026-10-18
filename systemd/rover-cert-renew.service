@@ -1,0 +1,10 @@
+[Unit]
+Description=Renew rover Tailscale HTTPS certs (MagicDNS)
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+Type=oneshot
+Environment=ROVER_CERT_DIR=/var/lib/rover/certs
+Environment=ROVER_CERT_RENEW_WITHIN_DAYS=21
+ExecStart=/opt/rover-firmware/pi/scripts/ensure_https_certs.sh

@@ -1,0 +1,8 @@
+# Default BLE transport
+paho-mqtt>=1.6.1
+dbus-next>=0.2.3
+# Legacy UART only (install.sh adds when ROVER_TRANSPORT=uart):
+# pyserial>=3.5
+#
+# Optional (legacy dbus-python + GLib stack); dbus-next is preferred:
+#   sudo apt install python3-dbus python3-gi

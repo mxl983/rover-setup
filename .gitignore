@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.log
+.DS_Store
+
+# Runtime secrets (provisioned on device via BLE)
+/var/
+mqtt.json
+*.pem
+*.key
+.env
+.env.*
