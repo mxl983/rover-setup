@@ -1,4 +1,4 @@
-"""J2 Rover Pi daemon — UART companion for the ESP32 portal."""
+"""J2 Rover Pi daemon — BLE companion for the ESP32 portal (UART optional legacy)."""
 
 from .daemon import RoverDaemon
 

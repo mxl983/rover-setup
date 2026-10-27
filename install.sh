@@ -217,8 +217,13 @@ fi
 mkdir -p /var/lib/rover
 chmod 755 /var/lib/rover
 
+cp "${ROOT}/systemd/rover-pi-status.service" /etc/systemd/system/rover-pi-status.service
+cp "${ROOT}/systemd/rover-pi-boot-finished.service" /etc/systemd/system/rover-pi-boot-finished.service
+
 systemctl daemon-reload
 systemctl enable rover-daemon.service
+systemctl enable rover-pi-status.service
+systemctl enable rover-pi-boot-finished.service
 systemctl enable tailscaled.service
 systemctl enable bluetooth.service 2>/dev/null || true
 systemctl enable rover-cert-renew.timer
@@ -236,12 +241,15 @@ systemctl restart bluetooth.service 2>/dev/null || true
 rfkill unblock bluetooth 2>/dev/null || true
 timeout 5 bluetoothctl power on 2>/dev/null || true
 systemctl restart rover-daemon.service
+systemctl restart rover-pi-status.service
+systemctl start rover-pi-boot-finished.service || true
 systemctl start rover-cert-renew.timer
 systemctl start rover-cert-renew.service || true
 
 echo
 echo "==> Installed — zero customer manual network setup after this."
 echo "    On every boot: NetworkManager + bluetooth + tailscaled + rover-daemon"
+echo "    Pi status: MQTT QoS 1 on topic_status — PI boot_start, PI heartbeat, PI boot_finished, PI shutdown"
 echo "    BLE setup: advertises J2-Pi; ESP sends WIFI_CONFIG over GATT"
 echo "    Rail-off: MQTT OFF GPIO16 (not UART SLEEP)"
 echo "    Certs: /var/lib/rover/certs/{cert.crt,cert.key} (auto-renew weekly)"
@@ -252,4 +260,4 @@ echo "    Advertise check: sudo bluetoothctl show | grep -i powered"
 echo "    Spec:    ${DEST}/pi/BLE_SETUP_PROTOCOL.md"
 echo
 systemctl --no-pager --full status rover-daemon || true
-systemctl is-enabled rover-daemon bluetooth tailscaled NetworkManager rover-cert-renew.timer 2>/dev/null || true
+systemctl is-enabled rover-daemon rover-pi-status rover-pi-boot-finished bluetooth tailscaled NetworkManager rover-cert-renew.timer 2>/dev/null || true

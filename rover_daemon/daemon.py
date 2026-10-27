@@ -87,7 +87,7 @@ class RoverDaemon:
             self._pump_rx()
             while self._deferred_msgs:
                 msg = self._deferred_msgs.pop(0)
-                log.info("RX (deferred) %s %s", msg.type, msg.raw)
+                log.info("RX (deferred) %s %s", msg.type, msg.redacted_raw())
                 self._on_message(msg)
             self._tick()
             time.sleep(0.05)
@@ -186,7 +186,7 @@ class RoverDaemon:
             for line in self._ble.pop_lines():
                 msg = protocol.try_parse_line(line)
                 if msg:
-                    log.info("RX %s %s", msg.type, msg.raw)
+                    log.info("RX %s %s", msg.type, msg.redacted_raw())
                     self._on_message(msg)
 
         if not self._ser:
@@ -203,7 +203,7 @@ class RoverDaemon:
             line, self._rx_buf = self._rx_buf.split("\n", 1)
             msg = protocol.try_parse_line(line)
             if msg:
-                log.info("RX %s %s", msg.type, msg.raw)
+                log.info("RX %s %s", msg.type, msg.redacted_raw())
                 self._on_message(msg)
 
     def _drain_rx_deferred(self) -> list:
@@ -411,6 +411,9 @@ class RoverDaemon:
                 renew_within_days=self.cfg.cert_renew_within_days,
                 dns=dns or None,
             )
+            # MQTT broker session comes from BLE WIFI_CONFIG (or ROVER_MQTT_*).
+            # Do not call Account API; password auth only (no client certs).
+            self._mqtt = mqtt_store.load_effective(self.cfg.mqtt_store_path)
             self._send(
                 protocol.setup_status(
                     "ready",
@@ -423,8 +426,12 @@ class RoverDaemon:
         elif new == State.EXECUTE_FACTORY_RESET:
             network.factory_reset_network(self.cfg.dry_run)
             self._send(protocol.command_ack(protocol.Cmd.WIPE_ALL.value, 0))
-            # Tell ESP to cut Pi rail (MQTT OFF GPIO16), then halt.
+            # Rail-off while wake_secret still on disk, then wipe mqtt.json.
             self._notify_esp_rail_off(reason="factory_wipe")
+            mqtt_store.clear_file(
+                self.cfg.mqtt_store_path, dry_run=self.cfg.dry_run
+            )
+            self._mqtt = MqttCreds()
             time.sleep(1.0)
             network.request_shutdown(self.cfg.dry_run)
 
@@ -441,24 +448,32 @@ class RoverDaemon:
         return "idle"
 
     def _persist_mqtt_from_wifi_config(self, msg: protocol.Message) -> None:
-        """Save mqtt_* / wake_secret from WIFI_CONFIG to /var/lib/rover/mqtt.json."""
+        """Save full BLE WIFI_CONFIG broker block → mqtt.json (0600)."""
         if not (
             msg.mqtt_host
+            or msg.mqtt_url
             or msg.mqtt_user
             or msg.mqtt_pass
+            or msg.mqtt_port
+            or msg.topic_prefix
             or msg.topic_cmd
             or msg.topic_status
             or msg.wake_secret
+            or msg.device_id
         ):
             log.info("WIFI_CONFIG has no MQTT fields — keeping existing mqtt.json")
             return
         merged = mqtt_store.from_wifi_config_fields(
             mqtt_host=msg.mqtt_host,
+            mqtt_port=msg.mqtt_port,
+            mqtt_url=msg.mqtt_url,
             mqtt_user=msg.mqtt_user,
             mqtt_pass=msg.mqtt_pass,
+            topic_prefix=msg.topic_prefix,
             topic_cmd=msg.topic_cmd,
             topic_status=msg.topic_status,
             wake_secret=msg.wake_secret,
+            device_id=msg.device_id,
             base=mqtt_store.load_file(self.cfg.mqtt_store_path),
         )
         ok = mqtt_store.save_file(
@@ -472,12 +487,25 @@ class RoverDaemon:
 
     def _notify_esp_rail_off(self, reason: str = "shutdown") -> None:
         """Pi → ESP: MQTT ``OFF GPIO16 DELAY 15 <wake_secret>`` (or UART SLEEP)."""
-        # Reload so reboot / late WIFI_CONFIG persist is always current.
+        # Use BLE-stored (or ROVER_MQTT_*) credentials — no Account API session.
         self._mqtt = mqtt_store.load_effective(self.cfg.mqtt_store_path)
-        payload = mqtt_store.rail_off_payload(self._mqtt)
+        # Tell the phone before rail-off. Parallel with the ESP publish so the
+        # power-off wait does not grow by another TLS handshake.
+        if not self.cfg.dry_run:
+            try:
+                from .pi_status import request_shutdown_status
+
+                request_shutdown_status(reason, creds=self._mqtt)
+            except Exception:
+                log.exception("PI shutdown status request failed")
 
         if self.cfg.dry_run:
-            log.info("dry_run: would rail-off ESP (%s) payload=%r", reason, payload)
+            try:
+                payload = mqtt_store.rail_off_payload(self._mqtt)
+                safe = mqtt_store.redact_command(payload, self._mqtt.wake_secret)
+            except ValueError as exc:
+                safe = f"<unavailable: {exc}>"
+            log.info("dry_run: would rail-off ESP (%s) payload=%r", reason, safe)
             return
 
         if self._use_uart and not self._use_ble:
@@ -490,30 +518,38 @@ class RoverDaemon:
         from .mqtt_rail import publish_rail_off
 
         if not self._mqtt.wake_secret:
-            log.warning(
-                "MQTT rail-off (%s) missing wake_secret — publishing without it",
+            log.error(
+                "MQTT rail-off (%s) missing wake_secret — ESP would NACK BAD_SECRET; "
+                "skipping publish (need BLE WIFI_CONFIG)",
                 reason,
             )
-        log.warning(
-            "MQTT rail-off (%s) payload=%r — ESP delays GPIO16 cut for Linux halt",
-            reason,
-            # Redact secret in logs
-            payload.rsplit(" ", 1)[0] + " ***"
-            if self._mqtt.wake_secret and payload.endswith(self._mqtt.wake_secret)
-            else payload,
-        )
-        ok = publish_rail_off(
-            self._mqtt.mqtt_host,
-            self._mqtt.mqtt_user,
-            self._mqtt.mqtt_pass,
-            topic=self._mqtt.topic_cmd,
-            payload=payload,
-            port=self._mqtt.resolved_port(),
-            use_tls=self._mqtt.use_tls(),
-        )
+            ok = False
+        else:
+            try:
+                safe = mqtt_store.redact_command(
+                    mqtt_store.rail_off_payload(self._mqtt),
+                    self._mqtt.wake_secret,
+                )
+            except ValueError:
+                safe = "OFF GPIO16 DELAY 15 ***"
+            log.warning(
+                "MQTT rail-off (%s) payload=%r — ESP delays GPIO16 cut for Linux halt",
+                reason,
+                safe,
+            )
+            ok = publish_rail_off(self._mqtt)
+        # Let rover-watch wait for publish attempt before poweroff.
+        try:
+            done = os.environ.get(
+                "ROVER_ESP_RAIL_OFF_DONE_PATH", "/tmp/esp-rail-off.done"
+            )
+            with open(done, "w", encoding="utf-8") as fh:
+                fh.write(f"{'ok' if ok else 'fail'} {reason}\n")
+        except OSError as exc:
+            log.warning("could not write rail-off done marker: %s", exc)
         if not ok:
             log.error(
-                "MQTT rail-off failed (%s) — need BLE WIFI_CONFIG mqtt_* fields "
+                "MQTT rail-off failed (%s) — need BLE WIFI_CONFIG mqtt_* + wake_secret "
                 "(or ROVER_MQTT_* overrides); Pi will still halt",
                 reason,
             )
@@ -524,11 +560,16 @@ class RoverDaemon:
         if not path or not os.path.isfile(path):
             return
         try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                note = fh.read(400).strip()
+        except OSError:
+            note = ""
+        try:
             os.remove(path)
         except OSError as exc:
             log.warning("could not remove %s: %s", path, exc)
             return
-        self._notify_esp_rail_off(reason=f"req_file:{path}")
+        self._notify_esp_rail_off(reason=note or "shutdown")
 
     def _tick(self) -> None:
         now = time.monotonic()

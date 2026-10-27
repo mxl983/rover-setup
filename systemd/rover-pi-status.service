@@ -1,0 +1,24 @@
+[Unit]
+Description=Rover Pi MQTT status (boot start and heartbeat)
+# Start before network-online so PI boot_start can leave as soon as Wi-Fi
+# has a route. Waiting for network-online held it until the rest of boot
+# was already active.
+DefaultDependencies=no
+After=local-fs.target NetworkManager.service
+Wants=NetworkManager.service
+Before=network-online.target rover-daemon.service rover-mediamtx.service rover-control.service rover-watch.service rover-pi-boot-finished.service shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rover-firmware/pi
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/rover-firmware/pi
+ExecStart=/opt/rover-firmware/venv/bin/python -m rover_daemon.pi_status run
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+User=root
+
+[Install]
+WantedBy=multi-user.target

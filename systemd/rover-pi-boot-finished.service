@@ -1,0 +1,19 @@
+[Unit]
+Description=Rover Pi MQTT boot finished
+# Runs after the camera is actually serving and control is listening,
+# not when systemd has merely forked those processes.
+After=network-online.target rover-pi-status.service rover-daemon.service rover-mediamtx.service rover-control.service rover-watch.service
+Wants=network-online.target rover-pi-status.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/rover-firmware/pi
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/rover-firmware/pi
+ExecStart=/opt/rover-firmware/venv/bin/python -m rover_daemon.pi_status boot_finished
+TimeoutStartSec=120
+User=root
+
+[Install]
+WantedBy=multi-user.target

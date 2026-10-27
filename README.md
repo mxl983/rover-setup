@@ -16,13 +16,21 @@ Always-on companion for the ESP32 portal:
 3. On `WIPE_NET` + `WIFI_CONFIG` → backup Wi‑Fi, join, then Tailscale auth-key
    rejoin. Never drops live Wi‑Fi before the new join is proven.
 4. **NORMAL_OPERATION** — periodic heartbeats; issues/renews HTTPS certs for MagicDNS
-5. Idle / manual halt (from `rover-control`): writes `/tmp/esp-sleep.req` →
+5. **Pi status** — `rover-pi-status` publishes `PI boot_start` as soon as Wi-Fi
+   can reach the broker (it does not wait for `network-online`), then
+   `PI heartbeat` every 5s. `rover-pi-boot-finished` publishes
+   `PI boot_finished` only after the camera path is ready and control is
+   listening. Idle, manual, factory, and OS halt publish `PI shutdown`
+   before the rail drops.
+6. Idle / manual halt (from `rover-control`): writes `/tmp/esp-sleep.req` →
    daemon publishes MQTT **`OFF GPIO16 DELAY 15 <wake_secret>`** → OS
    `poweroff` → ESP cuts rail after the delay
-6. `WIPE_ALL` → factory reset networks + MQTT rail-off + shutdown
+7. `WIPE_ALL` → factory reset networks + MQTT rail-off + shutdown
 
-MQTT broker creds + `wake_secret` arrive in BLE `WIFI_CONFIG` and are stored at
-`/var/lib/rover/mqtt.json` (0600). `ROVER_MQTT_*` env vars are optional overrides.
+MQTT broker creds + `wake_secret` arrive in BLE `WIFI_CONFIG` (full broker
+block: host/port/url, user/pass, topics, device_id) and are stored at
+`/var/lib/rover/mqtt.json` (0600). Connect with TLS + username/password — no
+client certs and no Account API. `ROVER_MQTT_*` env vars are optional overrides.
 
 HTTPS certs (`tailscale cert`) live at `/var/lib/rover/certs/{cert.crt,cert.key}`.
 Weekly `rover-cert-renew.timer` keeps them fresh.
@@ -62,8 +70,10 @@ pi/
   BLE_SETUP_PROTOCOL.md
   UART_PROTOCOL.md          # legacy framing reference
   requirements.txt
-  rover_daemon/             # Python package (ble_gatt, mqtt_rail, daemon)
+  rover_daemon/             # Python package (ble_gatt, mqtt_rail, pi_status, daemon)
   systemd/rover-daemon.service
+  systemd/rover-pi-status.service
+  systemd/rover-pi-boot-finished.service
 ```
 
 ## Quick reinstall

@@ -1,4 +1,4 @@
-"""UART JSON-line protocol (see pi/UART_PROTOCOL.md)."""
+"""Newline JSON setup protocol (BLE Notify/Write; UART legacy optional)."""
 
 from __future__ import annotations
 
@@ -9,6 +9,10 @@ from enum import Enum
 from typing import Any, Optional
 
 log = logging.getLogger("rover.protocol")
+
+_SECRET_KEYS = frozenset(
+    {"pass", "password", "mqtt_pass", "wake_secret", "key", "authkey"}
+)
 
 
 class Cmd(str, Enum):
@@ -47,12 +51,30 @@ class Message:
         return str(self.raw.get("mqtt_host") or "").strip()
 
     @property
+    def mqtt_port(self) -> int:
+        raw = self.raw.get("mqtt_port")
+        if raw in (None, ""):
+            return 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def mqtt_url(self) -> str:
+        return str(self.raw.get("mqtt_url") or "").strip()
+
+    @property
     def mqtt_user(self) -> str:
         return str(self.raw.get("mqtt_user") or "").strip()
 
     @property
     def mqtt_pass(self) -> str:
         return str(self.raw.get("mqtt_pass") or "")
+
+    @property
+    def topic_prefix(self) -> str:
+        return str(self.raw.get("topic_prefix") or "").strip().rstrip("/")
 
     @property
     def topic_cmd(self) -> str:
@@ -67,8 +89,22 @@ class Message:
         return str(self.raw.get("wake_secret") or "").strip()
 
     @property
+    def device_id(self) -> str:
+        return str(self.raw.get("device_id") or "").strip()
+
+    @property
     def result(self) -> int:
         return int(self.raw.get("result") or 0)
+
+    def redacted_raw(self) -> dict[str, Any]:
+        """Copy of raw suitable for logs (never passwords / keys / wake secret)."""
+        out: dict[str, Any] = {}
+        for k, v in self.raw.items():
+            if k in _SECRET_KEYS and v:
+                out[k] = "***"
+            else:
+                out[k] = v
+        return out
 
 
 def encode(msg_type: str, **fields: Any) -> bytes:
@@ -84,11 +120,10 @@ def try_parse_line(line: str) -> Optional[Message]:
     try:
         data = json.loads(line)
     except json.JSONDecodeError:
-        # ESP USB debug lines must never appear here; if they do, wiring is on UART0.
         if line.startswith("["):
-            log.debug("ignoring non-JSON UART line: %r", line[:80])
+            log.debug("ignoring non-JSON line: %r", line[:80])
         else:
-            log.warning("bad JSON from UART: %r", line[:120])
+            log.warning("bad JSON line: %r", line[:120])
         return None
     if not isinstance(data, dict) or "type" not in data:
         return None

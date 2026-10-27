@@ -12,7 +12,7 @@ Pi GATT → Pi joins with `--authkey`. **No login URL** is sent to the phone.
 | type | fields | When |
 |------|--------|------|
 | `COMMAND_LONG` | `cmd`: `WIPE_NET` \| `WIPE_ALL` | Setup wipe / factory reset |
-| `WIFI_CONFIG` | `ssid`, `pass`, **`key`** (required for product) | After wipe ACK |
+| `WIFI_CONFIG` | `ssid`, `pass`, MQTT broker block, **`key`** (required for product) | After wipe ACK |
 | `TS_AUTHKEY` | `key` | Optional duplicate handoff |
 
 `WIPE_NET`: **prepare only** — backup Wi‑Fi profiles; does **not** drop the
@@ -36,8 +36,9 @@ Wi‑Fi stays up; Tailscale is left alone until a key is provided.
 
 Before OS `poweroff`, `rover-control` / `rover-watch` write `/tmp/esp-sleep.req`.
 `rover-daemon` sees that file and publishes MQTT
-**`OFF GPIO16 DELAY 15 <wake_secret>`** on `topic_cmd` from
-`/var/lib/rover/mqtt.json` (see `BLE_SETUP_PROTOCOL.md`). Legacy UART mode still
+**`OFF GPIO16 DELAY 15 <wake_secret>`** on `topic_cmd` using TLS +
+username/password from `/var/lib/rover/mqtt.json` (BLE WIFI_CONFIG handoff; see
+`BLE_SETUP_PROTOCOL.md`). No client certs or Account API. Legacy UART mode still
 TX `SLEEP` instead.
 
 A bare `sudo poweroff` that skips this file will leave the rail on.
@@ -51,7 +52,7 @@ BLE checklist protocol: [`docs/SETUP_PROGRESS.md`](../docs/SETUP_PROGRESS.md).
 **Deprecated for product:** `TUNNEL_STATUS` / login URL (ignored by ESP if received).
 
 ```text
-{"type":"WIFI_CONFIG","ssid":"Home","pass":"secret","key":"tskey-auth-..."}
+{"type":"WIFI_CONFIG","ssid":"Home","pass":"secret","mqtt_host":"…","mqtt_port":8883,"mqtt_url":"mqtts://…","mqtt_user":"…","mqtt_pass":"…","topic_prefix":"tenants/…","topic_cmd":"tenants/…/cmd","topic_status":"tenants/…/status","wake_secret":"…","device_id":"…","key":"tskey-auth-..."}
 {"type":"SETUP_STATUS","stage":"ts_join","result":0,"detail":"joining"}
 {"type":"NODE_READY","dns":"rover.tailnet-name.ts.net"}
 ```

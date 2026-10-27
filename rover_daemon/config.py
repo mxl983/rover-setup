@@ -35,6 +35,7 @@ class Config:
     # Written by rover-control / rover-watch before OS halt; daemon publishes MQTT rail-off.
     esp_sleep_req_path: str = "/tmp/esp-sleep.req"
     # MQTT creds from BLE WIFI_CONFIG → this file; env ROVER_MQTT_* optional overrides.
+    # Broker auth: TLS + username/password (no client certs, no Account API).
     mqtt_store_path: str = "/var/lib/rover/mqtt.json"
 
 
