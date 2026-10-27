@@ -1,357 +1,342 @@
-# Install rover daemon on a fresh Raspberry Pi (4B & 5)
+# Master setup — new Pi / new SSD
 
-This guide takes a **new Raspberry Pi OS** install through enabling Bluetooth,
-copying the BLE daemon, and verifying the ESP can provision Wi‑Fi over GATT.
+**This is the canonical bring-up guide.** Agents also follow
+[`.cursor/skills/ssd-migration/SKILL.md`](.cursor/skills/ssd-migration/SKILL.md),
+which points here.
 
-Supported boards: **Raspberry Pi 4 Model B** and **Raspberry Pi 5**.
+Use this when: flashing a new SSD/NVMe, cloning onto a fresh Raspberry Pi OS,
+re-running installers, or **USB ports / serial devices moved** and
+`rover-control` is crash-looping.
 
-**Default transport is BLE** (`ROVER_TRANSPORT=ble`). UART setup wiring is
-legacy only (`ROVER_TRANSPORT=uart`). ESP still controls Pi power via GPIO16;
-rail-off is MQTT `OFF GPIO16`, not UART `SLEEP`.
+Supported boards: **Raspberry Pi 4 Model B** and **Raspberry Pi 5**.  
+OS: Raspberry Pi OS **64-bit** (Bookworm or Trixie). Reference unit
+`rover-demo` ran **2026-06-18** (Debian 13 / trixie).
 
-Protocol: [`BLE_SETUP_PROTOCOL.md`](BLE_SETUP_PROTOCOL.md).
+**Default transport is BLE** (`ROVER_TRANSPORT=ble`). ESP still controls Pi
+power via GPIO16; rail-off is MQTT `OFF GPIO16`, not UART `SLEEP`.
 
----
-
-## 0. What you need
-
-| Item | Notes |
-|------|--------|
-| Pi 4B or Pi 5 | Fresh Raspberry Pi OS (Bookworm recommended) |
-| Network | Ethernet or Wi‑Fi so you can `apt` / copy files |
-| ESP32 rover portal | BLE for setup; GPIO16 for Pi rail power |
-| Phone + ESP | BLE `WIFI_CONFIG` includes MQTT + `wake_secret` |
-| This repo’s `pi/` folder | Copied onto the Pi |
-
-**Hardware:** unplug ESP↔Pi UART RX/TX for setup. Keep power control via ESP GPIO16.
+Related: [`BLE_SETUP_PROTOCOL.md`](BLE_SETUP_PROTOCOL.md) ·
+[`UART_PROTOCOL.md`](UART_PROTOCOL.md) (legacy) ·
+[`README.md`](README.md)
 
 ---
 
-## 1. Flash the OS
+## Repos
 
-1. Use [Raspberry Pi Imager](https://www.raspberrypi.com/software/).
-2. Choose **Raspberry Pi OS (64-bit)** Lite or Desktop — either works.
-3. In Imager options, set hostname, user/password, enable SSH, and (optional) Wi‑Fi.
-4. Boot the Pi, SSH in:
+| Role | Repo | Branch | Installer |
+|------|------|--------|-----------|
+| Setup (BLE, Tailscale, certs, rail-off) | [`mxl983/rover-setup`](https://github.com/mxl983/rover-setup) | `main` | `sudo ./install.sh` |
+| Control (API, camera, motors, audio) | [`mxl983/rover`](https://github.com/mxl983/rover) | **`ios-flow`** | `cd pi-server && sudo ROVER_PROFILE=rover-demo ./install.sh` |
 
-```bash
-ssh <user>@<pi-hostname>.local
+Convention on the Pi:
+
+```text
+~/pi          → rover-setup clone   → installs to /opt/rover-firmware
+~/rover       → rover clone         → installs to /opt/rover-server
 ```
 
-Update packages:
+---
+
+## A. Fresh device — full checklist
+
+### A1. Flash OS
+
+1. [Raspberry Pi Imager](https://www.raspberrypi.com/software/) → **Raspberry Pi OS (64-bit)** Lite or Desktop.
+2. Set hostname, user/password, enable **SSH**, optional Wi‑Fi for first boot.
+3. Boot, SSH in, update:
 
 ```bash
 sudo apt update && sudo apt full-upgrade -y
 sudo reboot
 ```
 
----
-
-## 2. Wiring (ESP32 ↔ Pi)
-
-**BLE setup (default):** no UART RX/TX between ESP and Pi. ESP still drives the
-Pi power rail (GPIO16 HIGH = power on). Setup credentials go over BLE GATT.
-
-**Legacy UART only** (`ROVER_TRANSPORT=uart`):
-
-| ESP32 | Pi 40-pin header | Pi GPIO name |
-|-------|------------------|--------------|
-| **GPIO 17** (ESP TX) | **Pin 10** | GPIO 15 (RXD) |
-| **GPIO 16** (ESP RX) | **Pin 8** | GPIO 14 (TXD) |
-| **GND** | **Pin 6** (or any GND) | GND |
-
-Baud rate: **115200 8N1** (legacy).
-
----
-
-## 3. Enable Bluetooth (BLE) / UART (legacy)
-
-**Preferred:** `sudo ./install.sh` enables Bluetooth and starts the BLE daemon.
-For legacy UART it also runs `scripts/prepare_uart.sh`, which:
-
-- enables `enable_uart=1` (and Pi 5 `dtparam=uart0=on`)
-- removes `console=serial0` / `ttyS0` / `ttyAMA0` from cmdline
-- **masks serial-getty** so a login shell cannot steal the ESP UART
-- systemd `ExecStartPre` re-claims the port on every daemon start
-
-If you already installed once, re-run `sudo ./install.sh` (or
-`sudo /opt/rover-firmware/pi/scripts/prepare_uart.sh` then reboot if asked).
-
-### 3a. Manual fallback — raspi-config
+### A2. Clone (correct branches)
 
 ```bash
-sudo raspi-config
+git clone git@github.com:mxl983/rover-setup.git ~/pi
+# or: git clone https://github.com/mxl983/rover-setup.git ~/pi
+
+git clone git@github.com:mxl983/rover.git ~/rover
+cd ~/rover && git checkout ios-flow
 ```
 
-**Interface Options → Serial Port**
+> Do **not** stay on `rover` `main` — that tree has no `pi-server/` installer.
 
-1. Login shell over serial? → **No**
-2. Serial port hardware enabled? → **Yes**
-
-Then:
+### A3. Install setup first
 
 ```bash
-sudo /opt/rover-firmware/pi/scripts/claim_uart.sh
-sudo systemctl restart rover-daemon
+cd ~/pi
+sudo ./install.sh
+
+# Optional unattended Tailscale join:
+# sudo ROVER_TAILSCALE_AUTHKEY=tskey-auth-... \
+#      ROVER_TAILSCALE_API_KEY=tskey-api-... \
+#      ROVER_TAILSCALE_TAILNET=your.tailnet \
+#      ./install.sh
 ```
 
-### 3b. Pi 4B — confirm `/boot/firmware/config.txt`
+This enables NetworkManager, Bluetooth (+ BlueZ `Experimental`), `tailscaled`,
+`rover-daemon`, pi-status units, and weekly `rover-cert-renew.timer`.  
+BLE advertises **`J2-Pi`**.
 
-On Bookworm the file is `/boot/firmware/config.txt` (older images used `/boot/config.txt`).
-
-You should see something like:
-
-```ini
-enable_uart=1
-```
-
-After reboot, check:
+### A4. Install control second
 
 ```bash
-ls -l /dev/serial0
-# typically → ttyS0 or ttyAMA0
+cd ~/rover/pi-server
+sudo ROVER_PROFILE=rover-demo ./install.sh
 ```
 
-Use **`/dev/serial0`** in the daemon (default). That is the console UART alias on Pi 4B GPIO 14/15 when serial is enabled correctly.
+Enables **I2C**, Node 20, MediaMTX, hardware Python venv, ALSA, LiDAR udev,
+and systemd units (`rover-control`, `rover-mediamtx`, audio/talk/watch/log/lidar).
 
-### 3c. Pi 5 — GPIO 14/15 UART (important)
-
-On Pi 5, **`/dev/serial0` often points at the debug connector UART**, not the 40-pin header. For the ESP on pins 8/10 you must enable **UART0 on GPIO 14/15**.
-
-Edit config:
-
-```bash
-sudo nano /boot/firmware/config.txt
-```
-
-Add at the bottom:
-
-```ini
-# Rover: UART on 40-pin header (GPIO14 TX, GPIO15 RX)
-dtparam=uart0=on
-```
-
-Optional (makes `/dev/serial0` follow that UART — only if you also removed serial console from cmdline, or accept console on those pins):
-
-```ini
-dtparam=uart0_console=on
-```
-
-Safer for the rover: leave `serial0` alone and point the daemon at **`/dev/ttyAMA0`**:
-
-```bash
-ls -l /dev/ttyAMA0
-```
-
-Then set in the systemd unit (step 6):
-
-```ini
-Environment=ROVER_SERIAL=/dev/ttyAMA0
-```
-
-Reboot:
+If `/dev/i2c-1` is missing:
 
 ```bash
 sudo reboot
 ```
 
-### 3d. Quick UART sanity check
-
-With ESP powered and sending (or loopback TX↔RX for a bench test):
+### A5. Tailscale + HTTPS certs
 
 ```bash
-# Pi 4B default
-sudo cat /dev/serial0
+# If not joined via auth key / BLE yet:
+sudo tailscale up
+# Open the login URL, then Admin → Machines → Disable key expiry
 
-# Pi 5 header UART (typical)
-sudo cat /dev/ttyAMA0
+sudo systemctl start rover-cert-renew.service
+sudo ls -l /var/lib/rover/certs/cert.crt /var/lib/rover/certs/cert.key
+sudo systemctl restart rover-control rover-mediamtx
 ```
 
-You should eventually see JSON heartbeats once the daemon (or ESP) is running, e.g. `{"type":"HEARTBEAT",...}`.
+### A6. BLE provision MQTT (ESP + phone)
+
+Run onboarding so `WIFI_CONFIG` writes `/var/lib/rover/mqtt.json` (needed for
+rail-off / pi-status). Confirm:
+
+```bash
+systemctl is-active rover-daemon bluetooth tailscaled
+sudo ls -l /var/lib/rover/mqtt.json
+journalctl -u rover-daemon -n 40 --no-pager
+```
+
+### A7. USB serial + audio (do this if ports moved — see §B)
+
+```bash
+ls -l /dev/serial/by-id/
+grep -E '^(PICO_MOTOR_SERIAL_PORT|GIMBAL_SERIAL_PORT)=' /opt/rover-server/env/rover-server.env
+aplay -l; arecord -l
+```
+
+If by-id paths or ALSA card names do not match the env file, fix them **before**
+leaving `rover-control` restarting forever (§B).
+
+### A8. Smoke test
+
+```bash
+systemctl status rover-daemon rover-control rover-mediamtx rover-watch --no-pager
+curl -fsS http://127.0.0.1:9997/v3/paths/get/cam | head
+rover-log follow   # or: journalctl -u rover-control -f
+```
+
+Optional:
+
+| Item | Action |
+|------|--------|
+| LiDAR | Plug in → `sudo udevadm trigger --subsystem-match=tty && ls -l /dev/ldlidar` |
+| Piper TTS | Copy `.onnx` to `PIPER_MODEL_PATH` (default `/opt/rover-server/tts/zh_CN-huayan-medium.onnx`) — installer does **not** download the model |
 
 ---
 
-## 4. Install system dependencies
+## B. USB / serial port adjustments (prevents control crashes)
+
+### Why control crashes after moving USB
+
+`rover-control` opens motor + gimbal serial ports from
+`/opt/rover-server/env/rover-server.env`.
+
+| Path style | Survives plugging into a different USB jack? | Survives replacing the board/adapter? |
+|------------|-----------------------------------------------|----------------------------------------|
+| `/dev/serial/by-id/usb-…` | **Yes** (same physical device) | **No** — unique ID in the name changes |
+| `/dev/ttyACM0` / `ttyACM1` | **No** — Linux renumbers every boot/plug order | No |
+
+**Always use by-id.** Never leave production on `ttyACM*`.  
+If Pico and the QinHeng gimbal adapter swap ACM numbers, control may open the
+wrong device, hang, or crash-loop.
+
+LiDAR should stay on the udev symlink `/dev/ldlidar` (not a raw `ttyUSB*`).
+
+### B1. Discover current devices
 
 ```bash
-sudo apt install -y python3 python3-pip python3-venv git network-manager curl
+ls -l /dev/serial/by-id/
+# Example (rover-demo):
+#   usb-MicroPython_Board_in_FS_mode_<serial>-if00  → Pico motors
+#   usb-1a86_USB_Single_Serial_<serial>-if00        → F32C gimbal (QinHeng/WCH)
+
+# Optional: see which ACM node each maps to
+readlink -f /dev/serial/by-id/*
 ```
 
-**Tailscale** is installed automatically by `sudo ./install.sh` (official
-Tailscale install script). You do **not** need to run `tailscale up` by hand —
-ESP onboarding (or `ROVER_TAILSCALE_AUTHKEY`) joins the tailnet later.
+Identify:
 
-Manual fallback only if you skipped the installer:
+- **Pico** → name contains `MicroPython_Board_in_FS_mode`
+- **Gimbal** → name contains `1a86_USB_Single_Serial` (VID `1a86`)
+
+### B2. Patch env and restart (safe procedure)
 
 ```bash
-curl -fsSL https://tailscale.com/install.sh | sh
+ENV=/opt/rover-server/env/rover-server.env
+
+# 1) Stop control so it is not hammering a missing/wrong port
+sudo systemctl stop rover-control
+
+# 2) Set the live by-id paths (paste from ls output)
+sudo sed -i 's|^PICO_MOTOR_SERIAL_PORT=.*|PICO_MOTOR_SERIAL_PORT=/dev/serial/by-id/usb-MicroPython_Board_in_FS_mode_XXXX-if00|' "$ENV"
+sudo sed -i 's|^GIMBAL_SERIAL_PORT=.*|GIMBAL_SERIAL_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_XXXX-if00|' "$ENV"
+
+# Or edit by hand:
+#   sudo nano "$ENV"
+
+# 3) Confirm
+grep -E '^(PICO_MOTOR_SERIAL_PORT|GIMBAL_SERIAL_PORT)=' "$ENV"
+ls -l "$(grep ^PICO_MOTOR_SERIAL_PORT= "$ENV" | cut -d= -f2-)"
+ls -l "$(grep ^GIMBAL_SERIAL_PORT= "$ENV" | cut -d= -f2-)"
+
+# 4) Start again
+sudo systemctl reset-failed rover-control
+sudo systemctl start rover-control
+journalctl -u rover-control -n 30 --no-pager
 ```
 
-NetworkManager (`nmcli`) is used to wipe/connect Wi‑Fi during setup. Raspberry Pi OS Bookworm usually includes it; the package line above ensures it.
+Also update the git profile so the next SSD install stays correct:
+
+```bash
+# On the Pi, in the rover clone:
+nano ~/rover/pi-server/env/profiles/rover-demo.env
+# same PICO_MOTOR_SERIAL_PORT / GIMBAL_SERIAL_PORT values
+# commit + push on ios-flow when ready
+```
+
+### B3. Helper script (known rover-demo IDs)
+
+If this chassis still uses the original Pico + QinHeng IDs:
+
+```bash
+sudo /opt/rover-server/scripts/unblock_gimbal_serial.sh
+```
+
+That script **hardcodes** the demo by-id strings. After replacing hardware,
+edit the script or use §B2 instead.
+
+### B4. USB audio cards (mic / talk)
+
+Moving USB audio can break `rover-audio` / `rover-talk` (usually idle-wait, not
+a full control crash). Re-check card names:
+
+```bash
+aplay -l
+arecord -l
+grep -E '^ROVER_ALSA_|^ROVER_AUDIO_CAPTURE|^APLAY_DEVICE' /opt/rover-server/env/rover-server.env
+```
+
+Update `ROVER_ALSA_PLAYBACK_CARD`, `ROVER_ALSA_CAPTURE_CARD`,
+`ROVER_AUDIO_CAPTURE`, `APLAY_DEVICE_FALLBACK` to match `CARD=…` names, then:
+
+```bash
+sudo /opt/rover-server/scripts/install_alsa.sh /opt/rover-server
+sudo systemctl restart rover-audio rover-talk
+```
+
+### B5. Symptoms → fix
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `rover-control` restart loop; serial / Pico errors in log | Wrong or missing by-id; using `ttyACM*` | §B2 |
+| Motors dead, gimbal works (or reverse) | Pico/gimbal ACM swapped under `ttyACM*` | Switch to by-id; assign correctly |
+| Gimbal open fails after new adapter | New `…_Serial_<id>-if00` string | Update `GIMBAL_SERIAL_PORT` |
+| `/dev/ldlidar` missing | Unplugged or udev not triggered | Plug + `udevadm trigger` |
+| Audio unit flapping | Wrong ALSA `CARD=` name | §B4 |
 
 ---
 
-## 5. Copy the daemon onto the Pi and install
+## C. What each installer covers
 
-The OS will **not** load this code by itself from the SD/NVMe. You copy
-`pi/` onto the Pi, then run the installer **once**.
+### `rover-setup` (`~/pi/install.sh` → `/opt/rover-firmware`)
 
-### Easiest — `install.sh`
+- apt: python, bluez, NetworkManager, curl, openssl  
+- Tailscale + `tailscaled` enabled  
+- Bluetooth + BlueZ Experimental  
+- `rover-daemon`, `rover-pi-status`, `rover-pi-boot-finished`  
+- `rover-cert-renew.timer` → `/var/lib/rover/certs/{cert.crt,cert.key}`  
+- Optional: Tailscale/MQTT env drop-ins from installer env vars  
 
-From your Mac (repo root):
+### `rover` (`~/rover/pi-server/install.sh` → `/opt/rover-server`)
+
+- I2C enable (`raspi-config` / `config.txt`)  
+- Node 20, MediaMTX, npm ci, hardware venv (`pyserial`, `smbus2`, …)  
+- Copies profile → `env/rover-server.env` **only if that file does not exist yet**  
+- ALSA `/etc/asound.conf`, LiDAR udev, canonical logging  
+- Units: log, mediamtx, control, watch, audio, talk, lidar  
+
+**Not automatic from git alone:** Tailscale login, BLE MQTT file, Piper `.onnx`,
+and USB by-id if hardware differs from `rover-demo.env`.
+
+---
+
+## D. Tailscale key expiry (production)
+
+Node keys expire (~180 days) unless disabled — bad for field units.
+
+| Env (setup installer / drop-in) | Purpose |
+|---------------------------------|---------|
+| `ROVER_TAILSCALE_AUTHKEY` | Tagged auth key (`tag:rover`) — preferred |
+| `ROVER_TAILSCALE_API_KEY` | API token to disable expiry after join |
+| `ROVER_TAILSCALE_TAILNET` | Tailnet name (lookup helper) |
+
+Manual: [Machines](https://login.tailscale.com/admin/machines) → device →
+**Disable key expiry**.
+
+HTTPS `tailscale cert` (~90d) renews via `rover-cert-renew.timer` while online.
+
+---
+
+## E. Legacy UART (optional)
+
+Only if `sudo ROVER_TRANSPORT=uart ./install.sh`. Default is BLE — skip this.
+
+| ESP32 | Pi header | GPIO |
+|-------|-----------|------|
+| GPIO 17 (TX) | Pin 10 | GPIO 15 RX |
+| GPIO 16 (RX) | Pin 8 | GPIO 14 TX |
+| GND | Pin 6 | GND |
+
+`prepare_uart.sh` sets `enable_uart=1`, strips serial console from cmdline,
+masks serial-getty. **Pi 5:** often need `dtparam=uart0=on` and
+`ROVER_SERIAL=/dev/ttyAMA0` (not `serial0`).
+
+Daemon env: `ROVER_SERIAL`, `ROVER_BAUD=115200`, `ROVER_DRY_RUN`,
+`ROVER_CERT_DIR`, `ROVER_LOG_LEVEL`.
+
+---
+
+## F. Updating later
 
 ```bash
-scp -r pi user@pi-hostname.local:~/
-```
-
-On the Pi:
-
-```bash
-cd ~/pi
+# Setup
+cd ~/pi && git pull
 sudo ./install.sh
+
+# Control
+cd ~/rover && git checkout ios-flow && git pull
+cd pi-server && sudo ROVER_PROFILE=rover-demo ./install.sh
+# Note: existing /opt/rover-server/env/rover-server.env is kept as-is
 ```
 
-That script:
-
-1. Installs `python3` / venv / NetworkManager packages  
-2. Copies itself to `/opt/rover-firmware/pi`  
-3. Creates `/opt/rover-firmware/venv` and installs `requirements.txt`  
-4. Installs + enables `rover-daemon.service`  
-5. On Pi 5, prefers `/dev/ttyAMA0` when present  
-
-Then check:
-
-```bash
-sudo systemctl status rover-daemon
-sudo journalctl -u rover-daemon -f
-```
-
-### Manual (same result)
-
-See older step-by-step below only if you prefer not to use the script.
+After USB hardware changes, still do §B even if you re-ran install.
 
 ---
 
-## 6. First-boot checklist
+## G. Agent / skill note
 
-| Check | Command / expectation |
-|-------|------------------------|
-| Service running | `systemctl is-active rover-daemon` → `active` |
-| UART device exists | `ls -l $ROVER_SERIAL` |
-| Heartbeats TX | `journalctl -u rover-daemon` shows TX/STATE; ESP Serial Monitor shows `[UART] RX {"type":"HEARTBEAT"...}` |
-| ESP sees Pi | ESP leaves `WAKING_PI_FOR_SETUP` after heartbeat |
-| Dry-run bring-up | Set `ROVER_DRY_RUN=1`, restart service, exercise BLE setup without wiping Wi‑Fi |
-
-Disable dry-run for real robots:
-
-```bash
-sudo systemctl edit rover-daemon
-# or remove ROVER_DRY_RUN from the unit, then:
-sudo systemctl daemon-reload
-sudo systemctl restart rover-daemon
-```
-
----
-
-## 7. Environment reference
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `ROVER_SERIAL` | `/dev/serial0` | UART device (`/dev/ttyAMA0` on many Pi 5 setups) |
-| `ROVER_BAUD` | `115200` | Must match ESP |
-| `ROVER_DRY_RUN` | `0` | `1` = skip nmcli wipe / Tailscale / shutdown |
-| `ROVER_CERT_DIR` | `/var/lib/rover/certs` | HTTPS cert dir for MagicDNS (`cert.crt` / `cert.key`) |
-| `ROVER_CERT_RENEW_WITHIN_DAYS` | `21` | Reissue when fewer than N days remain |
-| `ROVER_LOG_LEVEL` | `INFO` | `DEBUG` for full TX/RX |
-
----
-
-## 8. Updating the daemon later
-
-```bash
-# from Mac
-scp -r pi user@pi-hostname.local:~/
-# on Pi
-sudo rm -rf /opt/rover-firmware/pi
-sudo mv ~/pi /opt/rover-firmware/pi
-sudo systemctl restart rover-daemon
-```
-
----
-
-## 9. Troubleshooting
-
-| Symptom | Likely fix |
-|---------|------------|
-| `No such file or directory: '/dev/serial0'` | UART not enabled; re-run raspi-config + reboot |
-| Pi 5: no data on serial0 | Use `/dev/ttyAMA0` + `dtparam=uart0=on` |
-| Permission denied on serial | Service should run as `root` (default unit) |
-| ESP never leaves WAKING_PI | TX/RX swapped, GND missing, or wrong `/dev` |
-| `nmcli: command not found` | `sudo apt install network-manager` |
-| `tailscale: not found` | Re-run `sudo ./install.sh` (installs Tailscale) |
-| Daemon changes Wi‑Fi while testing | Keep `ROVER_DRY_RUN=1` until ESP↔Pi path is proven (live setup no longer drops Wi‑Fi before a successful rejoin) |
-| Login shell steals UART | Fixed by install: `claim_uart.sh` masks getty; re-run install or that script |
-
-### Pi 4B vs Pi 5 summary
-
-| | Pi 4B | Pi 5 |
-|--|-------|------|
-| Enable serial | raspi-config + `enable_uart=1` | raspi-config + `dtparam=uart0=on` |
-| Typical device for ESP on pins 8/10 | `/dev/serial0` | `/dev/ttyAMA0` |
-| Debug connector UART | N/A (use header) | Separate; don’t assume `serial0` is the header |
-
----
-
-## 10. Zero-maintenance Tailscale (no key expiry)
-
-By default Tailscale **node keys expire** (~180 days). After expiry the device
-falls off the tailnet until someone re-authenticates — **bad for customers**.
-
-The daemon will try to **disable key expiry** after a successful join when you set:
-
-| Env var | Purpose |
-|---------|---------|
-| `ROVER_TAILSCALE_API_KEY` | Tailscale API access token (Admin → Settings → Keys) |
-| `ROVER_TAILSCALE_TAILNET` | Your tailnet name (optional fallback for device lookup) |
-| `ROVER_TAILSCALE_AUTHKEY` | **Recommended:** reusable/one-off **tagged** auth key (`tag:rover`) |
-
-### Recommended production setup
-
-1. In Tailscale ACL, define `tag:rover` for devices.
-2. Create an **auth key** that assigns `tag:rover`  
-   ([tagged devices have key expiry disabled by default](https://tailscale.com/docs/features/access-control/key-expiry)).
-3. Create an **API key** and put both in the systemd unit:
-
-```ini
-Environment=ROVER_TAILSCALE_AUTHKEY=tskey-auth-...
-Environment=ROVER_TAILSCALE_API_KEY=tskey-api-...
-Environment=ROVER_TAILSCALE_TAILNET=your-tailnet
-```
-
-4. After first connect, confirm in Admin → Machines that the rover shows
-   **Key expiry disabled**.
-
-### Manual fallback (SSO / interactive login)
-
-If you only use the browser login URL (no auth key / API key):
-
-1. Open [Machines](https://login.tailscale.com/admin/machines)
-2. Find the Pi → **⋮** → **Disable key expiry**
-
-Do this once per device after onboarding.
-
-### What does *not* need customer maintenance
-
-| Thing | Expires? | Notes |
-|-------|----------|--------|
-| Tailscale **node key** | Yes unless disabled | Must disable (API / tagged / admin UI) |
-| Auth key used at join | Yes (1–90 days) | Only needed for *new* joins; existing nodes stay |
-| HTTPS `tailscale cert` | ~90 days | Auto-renews if node stays online; not used by default daemon |
-
----
-
-## 11. Related docs in this folder
-
-- [`README.md`](README.md) — daemon behavior overview  
-- [`UART_PROTOCOL.md`](UART_PROTOCOL.md) — JSON line messages ESP ↔ Pi  
-- Root [`../README.md`](../README.md) — ESP GPIO wiring (power button, GPIO 4, etc.)
+When the user asks to set up a new Pi, migrate an SSD, fix USB serial crashes,
+or “run the installers”, follow this file. Prefer executing the commands on the
+device when possible; stop `rover-control` before rewriting serial paths (§B2).

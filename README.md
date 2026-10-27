@@ -38,17 +38,25 @@ Weekly `rover-cert-renew.timer` keeps them fresh.
 Setup protocol: **[`BLE_SETUP_PROTOCOL.md`](BLE_SETUP_PROTOCOL.md)**  
 Legacy UART framing reference: [`UART_PROTOCOL.md`](UART_PROTOCOL.md)
 
-## Fresh Pi install (4B & 5)
+## Fresh Pi / new SSD (master guide)
+
+**Follow [`INSTALL.md`](INSTALL.md)** — full dual-repo install, Tailscale/certs,
+BLE MQTT, and **USB serial port remapping** when moving Pico/gimbal plugs
+(prevents `rover-control` crash loops). Agents use
+[`.cursor/skills/ssd-migration/SKILL.md`](.cursor/skills/ssd-migration/SKILL.md).
+
+Quick path (details in INSTALL.md):
 
 ```bash
-cd /path/to/pi
-sudo ./install.sh
+git clone git@github.com:mxl983/rover-setup.git ~/pi
+git clone git@github.com:mxl983/rover.git ~/rover && cd ~/rover && git checkout ios-flow
+cd ~/pi && sudo ./install.sh
+cd ~/rover/pi-server && sudo ROVER_PROFILE=rover-demo ./install.sh
 ```
 
-Installs under `/opt/rover-firmware`, enables **Bluetooth**, **tailscaled**, and
-`rover-daemon`. Default transport is **BLE** (`ROVER_TRANSPORT=ble`) — no UART
-wiring required for setup. Keep ESP GPIO16 for Pi power control. MQTT +
-`wake_secret` are provisioned over BLE during phone setup.
+Setup install lands under `/opt/rover-firmware` (Bluetooth, `tailscaled`,
+`rover-daemon`). Default transport is **BLE**. MQTT + `wake_secret` come from
+phone BLE setup.
 
 **Phase 2 unattended join** (optional):
 
