@@ -1,10 +1,10 @@
 [Unit]
 Description=Rover Pi MQTT boot finished
-# Fire as soon as the camera stack is up. Do not wait for network-online or
-# rover-daemon (those added ~10s after cam was already ready). MQTT publish
-# retries if the link is still coming up.
-After=rover-mediamtx.service rover-control.service rover-watch.service rover-pi-status.service
-Wants=rover-pi-status.service rover-mediamtx.service rover-control.service
+# Fire when the camera/control stack is up. Do not wait on NetworkManager,
+# rover-pi-status, or network-online — those added ~10–20s after cam was ready.
+# MQTT publish retries inside pi_status if the link is still coming up.
+After=rover-mediamtx.service rover-control.service rover-watch.service
+Wants=rover-mediamtx.service rover-control.service
 
 [Service]
 Type=oneshot

@@ -1,11 +1,11 @@
 [Unit]
 Description=Rover Pi MQTT status (boot start and heartbeat)
-# Start with NetworkManager so PI boot_start can leave once Wi-Fi has a route.
-# Do NOT Before=mediamtx/control — that forced the camera to wait ~10s on NM.
+# Start at local-fs so MQTT status can come up in parallel with NM/Wi-Fi.
+# Do NOT Before=mediamtx/control or gate boot_finished — those forced ~10–20s waits.
 DefaultDependencies=no
-After=local-fs.target NetworkManager.service
+After=local-fs.target
 Wants=NetworkManager.service
-Before=network-online.target rover-daemon.service rover-pi-boot-finished.service shutdown.target
+Before=rover-daemon.service shutdown.target
 Conflicts=shutdown.target
 
 [Service]
