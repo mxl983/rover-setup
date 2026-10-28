@@ -623,9 +623,16 @@ class RoverDaemon:
                 return
 
         if msg.type == "WIFI_CONFIG":
+            # Accept during setup *and* re-provision from NORMAL_OPERATION so a
+            # late/retried phone WIFI_CONFIG still enrolls Wi‑Fi (never ignore
+            # after a successful Tailscale join left us without a saved profile).
             if self.state not in (
                 State.WIPE_NETWORK_PROFILES,
                 State.IDLE_LISTENING,
+                State.CONNECT_WIFI,
+                State.FETCH_TAILSCALE_URL,
+                State.AWAITING_SSO_LOGIN,
+                State.NORMAL_OPERATION,
             ):
                 log.warning("WIFI_CONFIG ignored in state %s", self.state.name)
                 return

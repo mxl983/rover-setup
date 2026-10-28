@@ -26,7 +26,8 @@ log = logging.getLogger("rover.mqtt_store")
 DEFAULT_PATH = "/var/lib/rover/mqtt.json"
 DEFAULT_DIR_MODE = 0o700
 DEFAULT_FILE_MODE = 0o600
-DEFAULT_RAIL_OFF_DELAY_SEC = 15
+# Keep short: this delay is added to every app power-off → next boot E2E time.
+DEFAULT_RAIL_OFF_DELAY_SEC = 5
 DEFAULT_MQTT_PORT_TLS = 8883
 DEFAULT_MQTT_PORT_PLAIN = 1883
 

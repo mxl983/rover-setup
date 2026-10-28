@@ -1,9 +1,10 @@
 [Unit]
 Description=Rover Pi MQTT boot finished
-# Runs after the camera is actually serving and control is listening,
-# not when systemd has merely forked those processes.
-After=network-online.target rover-pi-status.service rover-daemon.service rover-mediamtx.service rover-control.service rover-watch.service
-Wants=network-online.target rover-pi-status.service
+# Fire as soon as the camera stack is up. Do not wait for network-online or
+# rover-daemon (those added ~10s after cam was already ready). MQTT publish
+# retries if the link is still coming up.
+After=rover-mediamtx.service rover-control.service rover-watch.service rover-pi-status.service
+Wants=rover-pi-status.service rover-mediamtx.service rover-control.service
 
 [Service]
 Type=oneshot

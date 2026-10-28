@@ -50,7 +50,7 @@ def _run(cmd: list[str], dry_run: bool, timeout: float = 60) -> Tuple[int, str, 
 
 
 def wifi_already_connected() -> bool:
-    """True if we have a default route / active wifi IP."""
+    """True if a Wi‑Fi device is in NM state connected."""
     if not shutil.which("nmcli"):
         code, out, _ = _run(["hostname", "-I"], dry_run=False, timeout=5)
         return code == 0 and bool(out.strip())
@@ -126,13 +126,232 @@ def wait_for_internet(timeout_sec: float = INTERNET_WAIT_SEC) -> bool:
     return ok
 
 
+def _nmcli_profile_wifi_ssid(name: str) -> str:
+    """
+    SSID stored on one NM connection profile.
+
+    Important: ``nmcli -f …,802-11-wireless.ssid connection show`` (list mode)
+    is invalid on many NetworkManager builds — always query per-profile with -g.
+    """
+    if not name or not shutil.which("nmcli"):
+        return ""
+    code, out, _ = _run(
+        ["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", "id", name],
+        dry_run=False,
+        timeout=10,
+    )
+    if code != 0:
+        return ""
+    for line in (out or "").splitlines():
+        value = line.strip()
+        if value and value != "--":
+            return value
+    return ""
+
+
+def _wifi_profile_names() -> list[str]:
+    """Names of all NM Wi‑Fi connection profiles."""
+    if not shutil.which("nmcli"):
+        return []
+    code, out, _ = _run(
+        ["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
+        dry_run=False,
+        timeout=15,
+    )
+    if code != 0:
+        return []
+    names: list[str] = []
+    for line in out.splitlines():
+        if not line:
+            continue
+        name, _, rest = line.partition(":")
+        ctype = rest.split(":", 1)[0] if rest else ""
+        if name and ctype in ("802-11-wireless", "wifi"):
+            names.append(name)
+    return names
+
+
+def list_wifi_profiles() -> list[tuple[str, str]]:
+    """Return [(profile_name, ssid), ...] for every Wi‑Fi NM profile."""
+    result: list[tuple[str, str]] = []
+    for name in _wifi_profile_names():
+        result.append((name, _nmcli_profile_wifi_ssid(name)))
+    return result
+
+
+def find_wifi_profiles_for_ssid(ssid: str) -> list[str]:
+    """NM profile names that belong to ``ssid`` (by stored SSID or profile name)."""
+    if not ssid:
+        return []
+    names: list[str] = []
+    for name, profile_ssid in list_wifi_profiles():
+        if profile_ssid == ssid or name == ssid:
+            names.append(name)
+    return names
+
+
+def _active_wifi_connection_ids() -> set[str]:
+    """NM connection ids currently active on a Wi‑Fi device (must not be wiped)."""
+    ids: set[str] = set()
+    if not shutil.which("nmcli"):
+        return ids
+    code, out, _ = _run(
+        ["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"],
+        dry_run=False,
+        timeout=10,
+    )
+    if code == 0:
+        for line in out.splitlines():
+            parts = line.split(":")
+            if len(parts) < 2:
+                continue
+            name, ctype = parts[0], parts[1]
+            if name and ctype in ("802-11-wireless", "wifi"):
+                ids.add(name)
+    # Device property is authoritative even when profile naming is odd (netplan-*).
+    for dev in ("wlan0", "wlan1"):
+        code2, out2, _ = _run(
+            ["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", dev],
+            dry_run=False,
+            timeout=10,
+        )
+        if code2 != 0:
+            continue
+        conn = (out2 or "").strip().splitlines()
+        if conn and conn[0] and conn[0] != "--":
+            ids.add(conn[0])
+    return ids
+
+
+def wifi_enrollment_verified(ssid: str) -> bool:
+    """True when a reboot-durable NM profile exists for ``ssid``."""
+    return bool(find_wifi_profiles_for_ssid(ssid))
+
+
+def ensure_persistent_wifi_enrollment(
+    ssid: str, password: str, dry_run: bool
+) -> bool:
+    """
+    Guarantee a reboot-persistent NM Wi‑Fi profile for ``ssid``.
+
+    Works for both fresh joins and "already associated" (e.g. netplan-wlan0-*)
+    so WIFI_CONFIG never ACKs success without a saved profile + autoconnect.
+    """
+    if not ssid:
+        return False
+    if dry_run:
+        log.info("[dry-run] ensure persistent wifi enrollment ssid=%s", ssid)
+        return True
+    if not shutil.which("nmcli"):
+        log.error("nmcli not found")
+        return False
+
+    names = find_wifi_profiles_for_ssid(ssid)
+    if not names:
+        log.info(
+            "no saved Wi‑Fi profile for ssid=%s — creating persistent enrollment",
+            ssid,
+        )
+        if current_wifi_ssid() == ssid and wifi_already_connected():
+            # Add a saved profile without requiring a disconnect first.
+            cmd = [
+                "nmcli",
+                "connection",
+                "add",
+                "type",
+                "wifi",
+                "con-name",
+                ssid,
+                "ifname",
+                "*",
+                "ssid",
+                ssid,
+                "connection.autoconnect",
+                "yes",
+                "connection.autoconnect-priority",
+                "100",
+            ]
+            if password:
+                cmd += [
+                    "wifi-sec.key-mgmt",
+                    "wpa-psk",
+                    "wifi-sec.psk",
+                    password,
+                ]
+            code, out, err = _run(cmd, dry_run=False, timeout=30)
+            if code != 0:
+                log.warning(
+                    "connection add failed for %s (%s %s) — trying device connect",
+                    ssid,
+                    out.strip(),
+                    err.strip(),
+                )
+                if not _nmcli_wifi_connect_once(ssid, password, 45):
+                    return False
+                if not wait_for_wifi_connected(WIFI_IP_WAIT_SEC):
+                    return False
+        else:
+            if not _nmcli_wifi_connect_once(ssid, password, 45):
+                return False
+            if not wait_for_wifi_connected(WIFI_IP_WAIT_SEC):
+                return False
+        names = find_wifi_profiles_for_ssid(ssid)
+
+    if not names:
+        log.error("wifi enrollment failed — still no NM profile for ssid=%s", ssid)
+        return False
+
+    for name in names:
+        _run(
+            [
+                "nmcli",
+                "connection",
+                "modify",
+                "id",
+                name,
+                "connection.autoconnect",
+                "yes",
+                "connection.autoconnect-priority",
+                "100",
+            ],
+            dry_run=False,
+            timeout=15,
+        )
+        if password:
+            # Phone-provisioned PSK is the source of truth during WIFI_CONFIG.
+            c2, _, e2 = _run(
+                [
+                    "nmcli",
+                    "connection",
+                    "modify",
+                    "id",
+                    name,
+                    "wifi-sec.key-mgmt",
+                    "wpa-psk",
+                    "wifi-sec.psk",
+                    password,
+                ],
+                dry_run=False,
+                timeout=15,
+            )
+            if c2 != 0:
+                log.warning("wifi PSK update failed for profile %s: %s", name, e2)
+        log.info("wifi enrolled profile=%s ssid=%s autoconnect=yes", name, ssid)
+
+    ok = wifi_enrollment_verified(ssid)
+    if not ok:
+        log.error("wifi enrollment verification failed for ssid=%s", ssid)
+    return ok
+
+
 def connect_wifi(ssid: str, password: str, dry_run: bool, timeout_sec: int) -> bool:
     """
-    Join Wi‑Fi without stranding the Pi.
+    Join Wi‑Fi and leave a reboot-durable NM profile.
 
-    - If already on this SSID: keep the live link (no flap). Do **not** rewrite
-      the stored PSK — a wrong phone password would poison reboot autoconnect.
-    - Otherwise connect with retries, verify association, then drop *other* profiles.
+    - Always enroll a persistent profile (create/update + autoconnect) before ACK.
+    - If already on this SSID: keep the live link, enroll/update the saved profile,
+      then drop *other* profiles only after enrollment is verified.
+    - Never treat "associated right now" as success without a saved profile.
     - On failure: restore the WIPE_NET backup so previous Wi‑Fi comes back.
     """
     if not ssid:
@@ -149,13 +368,35 @@ def connect_wifi(ssid: str, password: str, dry_run: bool, timeout_sec: int) -> b
     active = current_wifi_ssid()
     if active == ssid and wifi_already_connected():
         log.info(
-            "already connected to ssid=%s — keeping live link + existing password "
-            "(same Wi‑Fi re-pair is OK)",
+            "already associated to ssid=%s — ensuring persistent NM enrollment",
             ssid,
         )
-        ensure_wifi_autoconnect(ssid, dry_run=False)
-        wipe_wifi_profiles(False, keep_ssid=ssid)
-        return True
+        if ensure_persistent_wifi_enrollment(ssid, password, dry_run=False):
+            wipe_wifi_profiles(False, keep_ssid=ssid)
+            if wifi_enrollment_verified(ssid):
+                # Association may briefly report down while NM reloads; require
+                # either still connected or a saved profile we can bring up.
+                if wifi_already_connected() or wait_for_wifi_connected(10.0):
+                    log.info("wifi enroll OK (already associated) ssid=%s", ssid)
+                    return True
+                # Profile exists — try bringing it up explicitly.
+                for name in find_wifi_profiles_for_ssid(ssid):
+                    _run(
+                        ["nmcli", "connection", "up", "id", name],
+                        dry_run=False,
+                        timeout=float(timeout_sec),
+                    )
+                    if wait_for_wifi_connected(WIFI_IP_WAIT_SEC):
+                        log.info("wifi enroll OK after connection up ssid=%s", ssid)
+                        return True
+            log.error(
+                "wifi profile lost after enroll/wipe for ssid=%s — not ACKing success",
+                ssid,
+            )
+        else:
+            log.warning(
+                "persistent enroll failed while associated — falling through to reconnect"
+            )
 
     # Snapshot again right before we risk changing association.
     backup_wifi_profiles(False)
@@ -180,9 +421,19 @@ def connect_wifi(ssid: str, password: str, dry_run: bool, timeout_sec: int) -> b
             time.sleep(WIFI_CONNECT_RETRY_DELAY_SEC)
 
     if last_ok:
-        ensure_wifi_autoconnect(ssid, dry_run=False)
+        if not ensure_persistent_wifi_enrollment(ssid, password, dry_run=False):
+            log.error("wifi associated but persistent enrollment failed for ssid=%s", ssid)
+            restore_wifi_profiles(False)
+            return False
         # Only now drop other profiles — never before the new link is proven.
         wipe_wifi_profiles(False, keep_ssid=ssid)
+        if not wifi_enrollment_verified(ssid):
+            log.error(
+                "wifi profile missing after wipe for ssid=%s — restoring backup",
+                ssid,
+            )
+            restore_wifi_profiles(False)
+            return False
         log.info("wifi join OK for ssid=%s", ssid)
         return True
 
@@ -283,40 +534,44 @@ def restore_wifi_profiles(dry_run: bool) -> bool:
 
 
 def wipe_wifi_profiles(dry_run: bool, *, keep_ssid: str = "") -> bool:
-    """Delete NetworkManager Wi-Fi connection profiles (optionally keep one SSID)."""
+    """
+    Delete NetworkManager Wi‑Fi profiles (optionally keep one SSID).
+
+    Safety rules when ``keep_ssid`` is set (WIFI_CONFIG path):
+    - Resolve each profile's SSID with per-connection ``nmcli -g`` (list-mode
+      ``802-11-wireless.ssid`` is invalid on many NM builds).
+    - Never delete the live/active Wi‑Fi connection.
+    - Never delete a profile whose SSID cannot be resolved (refuse to guess).
+    """
     if dry_run:
         log.info("[dry-run] wipe wifi profiles (keep_ssid=%r)", keep_ssid)
         return True
     if not shutil.which("nmcli"):
         log.error("nmcli not found")
         return False
-    code, out, err = _run(
-        ["nmcli", "-t", "-f", "NAME,TYPE,802-11-wireless.ssid", "connection", "show"],
-        dry_run=False,
-    )
-    if code != 0:
-        # Older nmcli may not accept the ssid field in list — fall back.
-        code, out, err = _run(
-            ["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
-            dry_run=False,
-        )
-        if code != 0:
-            log.error("nmcli list failed: %s", err)
-            return False
+
+    active_ids = _active_wifi_connection_ids() if keep_ssid else set()
     ok = True
-    for line in out.splitlines():
-        if not line:
+    for name, profile_ssid in list_wifi_profiles():
+        if keep_ssid and (name == keep_ssid or profile_ssid == keep_ssid):
+            log.info(
+                "keeping Wi‑Fi profile %s (ssid=%s)",
+                name,
+                profile_ssid or keep_ssid,
+            )
             continue
-        parts = line.split(":")
-        name = parts[0] if parts else ""
-        ctype = parts[1] if len(parts) > 1 else ""
-        profile_ssid = parts[2] if len(parts) > 2 else ""
-        if ctype not in ("802-11-wireless", "wifi"):
+        if keep_ssid and name in active_ids:
+            log.warning(
+                "keeping active Wi‑Fi profile %s (ssid=%r) — refuse to drop live link",
+                name,
+                profile_ssid,
+            )
             continue
-        if keep_ssid and (
-            name == keep_ssid or profile_ssid == keep_ssid
-        ):
-            log.info("keeping active Wi‑Fi profile %s (ssid=%s)", name, keep_ssid)
+        if keep_ssid and not profile_ssid and name != keep_ssid:
+            log.warning(
+                "keeping Wi‑Fi profile %s (ssid unresolved; refuse to guess)",
+                name,
+            )
             continue
         c2, _, e2 = _run(
             ["nmcli", "connection", "delete", "id", name],
@@ -341,75 +596,82 @@ def _nmcli_wifi_connect_once(ssid: str, password: str, timeout_sec: int) -> bool
 
 
 def ensure_wifi_autoconnect(ssid: str, dry_run: bool) -> None:
-    """Mark the NM profile for this SSID to connect automatically on boot."""
+    """Mark every NM profile for this SSID to connect automatically on boot."""
     if dry_run or not ssid or not shutil.which("nmcli"):
         return
-    code, _, err = _run(
-        [
-            "nmcli",
-            "connection",
-            "modify",
-            "id",
-            ssid,
-            "connection.autoconnect",
-            "yes",
-            "connection.autoconnect-priority",
-            "100",
-        ],
-        dry_run=False,
-        timeout=15,
-    )
-    if code != 0:
-        # Profile name may not equal SSID — try matching by wifi.ssid.
-        code2, out, _ = _run(
-            ["nmcli", "-t", "-f", "NAME,802-11-wireless.ssid", "connection", "show"],
+    names = find_wifi_profiles_for_ssid(ssid)
+    if not names:
+        log.warning("wifi autoconnect: no profile found for ssid=%s", ssid)
+        return
+    for name in names:
+        code, _, err = _run(
+            [
+                "nmcli",
+                "connection",
+                "modify",
+                "id",
+                name,
+                "connection.autoconnect",
+                "yes",
+                "connection.autoconnect-priority",
+                "100",
+            ],
             dry_run=False,
             timeout=15,
         )
-        if code2 == 0:
-            for line in out.splitlines():
-                name, _, wifi_ssid = line.partition(":")
-                if wifi_ssid == ssid and name:
-                    _run(
-                        [
-                            "nmcli",
-                            "connection",
-                            "modify",
-                            "id",
-                            name,
-                            "connection.autoconnect",
-                            "yes",
-                            "connection.autoconnect-priority",
-                            "100",
-                        ],
-                        dry_run=False,
-                        timeout=15,
-                    )
-                    log.info("wifi autoconnect enabled for profile %s (ssid=%s)", name, ssid)
-                    return
-        log.warning("wifi autoconnect set failed for %s: %s", ssid, err)
-    else:
-        log.info("wifi autoconnect enabled for %s", ssid)
+        if code != 0:
+            log.warning("wifi autoconnect set failed for profile %s: %s", name, err)
+        else:
+            log.info("wifi autoconnect enabled for profile %s (ssid=%s)", name, ssid)
 
 
 def ensure_tailscaled_service(dry_run: bool) -> bool:
-    """Enable + start tailscaled so Tailscale comes back on every boot."""
+    """Ensure tailscaled is enabled/started without boot-time daemon-reload.
+
+    ``systemctl enable`` on an already-enabled unit still triggers a systemd
+    reload on this image and stalls NetworkManager (~seconds). Only enable
+    when needed; only start when inactive.
+    """
     if dry_run:
-        log.info("[dry-run] would enable --now tailscaled")
+        log.info("[dry-run] would ensure tailscaled enabled+started")
         return True
     if not shutil.which("systemctl"):
         log.warning("systemctl not found — cannot ensure tailscaled on boot")
         return False
-    ok = True
-    for cmd in (
-        ["systemctl", "enable", "tailscaled.service"],
-        ["systemctl", "start", "tailscaled.service"],
-    ):
-        code, _, err = _run(cmd, dry_run=False, timeout=30)
+
+    code, out, err = _run(
+        ["systemctl", "is-enabled", "tailscaled.service"],
+        dry_run=False,
+        timeout=10,
+    )
+    enabled = out.strip() == "enabled"
+    # is-enabled returns 1 for disabled; still parse stdout.
+    if not enabled:
+        code, _, err = _run(
+            ["systemctl", "enable", "tailscaled.service"],
+            dry_run=False,
+            timeout=30,
+        )
         if code != 0:
-            log.warning("%s failed: %s", " ".join(cmd), err)
-            ok = False
-    return ok
+            log.warning("systemctl enable tailscaled.service failed: %s", err)
+            return False
+
+    code, out, _ = _run(
+        ["systemctl", "is-active", "tailscaled.service"],
+        dry_run=False,
+        timeout=10,
+    )
+    if out.strip() == "active":
+        return True
+    code, _, err = _run(
+        ["systemctl", "start", "tailscaled.service"],
+        dry_run=False,
+        timeout=30,
+    )
+    if code != 0:
+        log.warning("systemctl start tailscaled.service failed: %s", err)
+        return False
+    return True
 
 
 def ensure_tailscale_enabled(

@@ -41,12 +41,16 @@ BOOT_FINISHED_SENT = RUN_DIR / "pi-boot-finished-sent"
 SHUTDOWN_REQ = RUN_DIR / "pi-shutdown.req"
 SHUTDOWN_SENT = RUN_DIR / "pi-shutdown-sent"
 
-# Core stack. Audio and lidar are optional hardware and must not hold boot %.
+# Camera / control stack must be up for boot_finished. Daemon needs Wi-Fi and
+# used to hold cam=ready ~10s after the stream was already live — report it
+# but do not block on it.
 STACK_UNITS = (
-    "rover-daemon",
     "rover-mediamtx",
     "rover-control",
     "rover-watch",
+)
+OPTIONAL_STACK_UNITS = (
+    "rover-daemon",
 )
 STACK_WAIT_SEC = 90.0
 HEARTBEAT_SEC = 5.0
@@ -169,15 +173,6 @@ def _unit_active(name: str) -> str:
     return state or "unknown"
 
 
-def stack_states() -> dict[str, str]:
-    """ActiveState for installed core units. Missing units are omitted."""
-    states: dict[str, str] = {}
-    for name in STACK_UNITS:
-        if _unit_loaded(name):
-            states[name.removeprefix("rover-")] = _unit_active(name)
-    return states
-
-
 def _control_port() -> int:
     raw = os.environ.get("ROVER_CONTROL_PORT", "").strip()
     if raw.isdigit():
@@ -223,20 +218,30 @@ def _cam_ready() -> bool:
     return bool(isinstance(data, dict) and data.get("ready"))
 
 
+def stack_states() -> dict[str, str]:
+    """ActiveState for required + optional core units. Missing units omitted."""
+    states: dict[str, str] = {}
+    for name in (*STACK_UNITS, *OPTIONAL_STACK_UNITS):
+        if _unit_loaded(name):
+            states[name.removeprefix("rover-")] = _unit_active(name)
+    return states
+
+
 def wait_for_stack(timeout_s: float = STACK_WAIT_SEC) -> dict[str, str]:
-    """Block until the core stack is actually up, or the timeout hits.
+    """Block until the camera stack is actually up, or the timeout hits.
 
     ``systemctl is-active`` flips true as soon as a Type=simple process is
-    forked, which is the same moment MQTT comes up. Waiting for the camera
-    path and the control port keeps ``PI boot_finished`` at the end of boot.
+    forked. Waiting for the camera path and the control port keeps
+    ``PI boot_finished`` aligned with a live stream — not with Wi-Fi/daemon.
     """
     deadline = time.monotonic() + max(0.0, timeout_s)
     want_cam = _unit_loaded("rover-mediamtx")
     want_control = _unit_loaded("rover-control")
+    required = [name.removeprefix("rover-") for name in STACK_UNITS if _unit_loaded(name)]
     port = _control_port()
     while True:
         states = stack_states()
-        units_ok = not states or all(state == "active" for state in states.values())
+        units_ok = all(states.get(name) == "active" for name in required)
         cam_ok = _cam_ready() if want_cam else True
         control_ok = _tcp_open(port) if want_control else True
         if units_ok and cam_ok and control_ok:
@@ -251,7 +256,7 @@ def wait_for_stack(timeout_s: float = STACK_WAIT_SEC) -> dict[str, str]:
             if want_control:
                 states["control_port"] = "open" if control_ok else "down"
             return states
-        time.sleep(1.0)
+        time.sleep(0.5)
 
 
 def system_is_stopping() -> bool:
