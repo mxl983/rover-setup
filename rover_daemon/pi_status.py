@@ -5,9 +5,10 @@ the same topic. The second token is the event. Further tokens are ``key=value``
 and never contain spaces.
 
     PI boot_start boot_id=… ts=… boot_ts=… uptime_s=… device=…
-    PI boot_finished boot_id=… ts=… boot_ts=… uptime_s=… daemon=active …
+    PI cam_ready boot_id=… ts=… boot_ts=… uptime_s=… cam=ready device=…
+    PI boot_finished boot_id=… ts=… boot_ts=… uptime_s=… cam=ready … 
     PI shutdown boot_id=… ts=… boot_ts=… uptime_s=… reason=idle|manual|factory|reboot|halt
-    PI heartbeat boot_id=… ts=… boot_ts=… uptime_s=… seq=… phase=boot|up
+    PI heartbeat boot_id=… ts=… boot_ts=… uptime_s=… seq=… phase=boot|up [cam=ready|down]
 
 ``boot_ts`` is the kernel boot time (unix seconds), not the publish time, so a
 late MQTT connect still tells the phone when power-on started. Messages are
@@ -15,6 +16,11 @@ not retained: a retained heartbeat would erase a queued boot or shutdown.
 QoS 1 queues them for a persistent iOS session (clean session off, subscribe
 QoS 1). Heartbeats are not a last-will: a broker disconnect would otherwise
 mark the Pi offline during a short link drop.
+
+iOS video (WHEP): start/retry as soon as ``PI cam_ready`` (or any heartbeat
+with ``cam=ready``). Do **not** wait for gimbal telemetry or ``boot_finished``.
+``boot_finished`` means the full control stack is up; cam was often ready
+several seconds earlier.
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ log = logging.getLogger("rover.pi_status")
 
 RUN_DIR = Path("/run/rover")
 BOOT_START_SENT = RUN_DIR / "pi-boot-start-sent"
+CAM_READY_SENT = RUN_DIR / "pi-cam-ready-sent"
 BOOT_FINISHED_REQ = RUN_DIR / "pi-boot-finished.req"
 BOOT_FINISHED_SENT = RUN_DIR / "pi-boot-finished-sent"
 SHUTDOWN_REQ = RUN_DIR / "pi-shutdown.req"
@@ -43,7 +50,8 @@ SHUTDOWN_SENT = RUN_DIR / "pi-shutdown-sent"
 
 # Camera / control stack must be up for boot_finished. Daemon needs Wi-Fi and
 # used to hold cam=ready ~10s after the stream was already live — report it
-# but do not block on it.
+# but do not block on it. ``cam_ready`` fires as soon as MediaMTX path cam is
+# live so iOS can start WHEP without waiting for control/gimbal/MQTT stack.
 STACK_UNITS = (
     "rover-mediamtx",
     "rover-control",
@@ -55,6 +63,9 @@ OPTIONAL_STACK_UNITS = (
 STACK_WAIT_SEC = 90.0
 HEARTBEAT_SEC = 5.0
 PUBLISH_TIMEOUT_SEC = 8.0
+# Keep trying MQTT after cam is up — Wi-Fi often lags the local stream by a few seconds.
+MQTT_RETRY_SEC = 45.0
+MQTT_RETRY_GAP_SEC = 0.5
 MEDIAMTX_API = "http://127.0.0.1:9997/v3/paths/get/cam"
 
 _TOKEN_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
@@ -471,6 +482,39 @@ def publish_boot_start(creds: Optional[MqttCreds] = None) -> bool:
     return False
 
 
+def publish_cam_ready(creds: Optional[MqttCreds] = None) -> bool:
+    """Tell iOS the H264 path is live — start WHEP now (do not wait for gimbal)."""
+    if _committed(CAM_READY_SENT):
+        return True
+    if not _cam_ready():
+        return False
+    if not _committed(BOOT_START_SENT):
+        # Prefer ordered boot_start → cam_ready when the broker is already up.
+        publish_boot_start(creds)
+    creds = creds or mqtt_store.load_effective()
+    fields = _common_fields(creds)
+    fields["cam"] = "ready"
+    payload = format_message("cam_ready", **fields)
+    if not _claim(CAM_READY_SENT):
+        return _committed(CAM_READY_SENT)
+    if _publish_once(creds, payload, client_id=_client_id("rover-pi-cam")):
+        _commit(CAM_READY_SENT, payload)
+        return True
+    _release(CAM_READY_SENT)
+    return False
+
+
+def _retry_until(publish_fn, *, timeout_s: float, gap_s: float = MQTT_RETRY_GAP_SEC) -> bool:
+    """Call publish_fn until it returns True or the deadline hits."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        if publish_fn():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(gap_s)
+
+
 def publish_boot_finished(
     states: Optional[dict[str, str]] = None,
     creds: Optional[MqttCreds] = None,
@@ -485,6 +529,9 @@ def publish_boot_finished(
     fields = _common_fields(creds)
     if states:
         fields.update(states)
+    # Always stamp cam when we know it — iOS may have missed cam_ready.
+    if fields.get("cam") != "ready" and _cam_ready():
+        fields["cam"] = "ready"
     payload = format_message("boot_finished", **fields)
     if not _claim(BOOT_FINISHED_SENT):
         return _committed(BOOT_FINISHED_SENT)
@@ -536,7 +583,20 @@ def request_shutdown_status(reason: str, creds: Optional[MqttCreds] = None) -> N
 
 
 def mark_boot_finished() -> bool:
-    """Late boot hook: wait for the core stack, then queue ``PI boot_finished``."""
+    """Wait for cam first (early iOS WHEP kick), then full stack + boot_finished.
+
+    ``PI cam_ready`` is published as soon as MediaMTX reports the cam path ready,
+    with MQTT retries while Wi-Fi/Tailscale catch up. ``PI boot_finished`` still
+    means mediamtx + control + watch are up — but phones should not wait for it
+    to start video.
+    """
+    cam_deadline = time.monotonic() + STACK_WAIT_SEC
+    while time.monotonic() < cam_deadline and not _cam_ready():
+        time.sleep(0.25)
+    if _cam_ready():
+        log.info("cam path ready — publishing PI cam_ready for early WHEP")
+        _retry_until(publish_cam_ready, timeout_s=MQTT_RETRY_SEC)
+
     states = wait_for_stack()
     body = " ".join(f"{key}={_token(value)}" for key, value in states.items())
     try:
@@ -545,8 +605,8 @@ def mark_boot_finished() -> bool:
     except OSError as exc:
         log.warning("could not write %s: %s", BOOT_FINISHED_REQ, exc)
     log.info("boot finished queue %s", body or "(no core units)")
-    # Publish directly as well, in case the heartbeat service is not up yet.
-    return publish_boot_finished(states)
+    # Retry until broker reachable — do not exit after one failed publish.
+    return _retry_until(lambda: publish_boot_finished(states), timeout_s=MQTT_RETRY_SEC)
 
 
 def _parse_state_line(text: str) -> dict[str, str]:
@@ -611,14 +671,18 @@ def run_service() -> None:
             time.sleep(0.5)
             continue
 
+        # Faster reconnect while video/boot signals are still pending.
+        boot_pending = not _committed(BOOT_FINISHED_SENT) or not _committed(CAM_READY_SENT)
+        retry_sleep = 0.5 if boot_pending else 2.0
+
         if not creds.has_broker() or not (creds.topic_status or "").strip():
-            time.sleep(2.0)
+            time.sleep(retry_sleep)
             continue
 
         if not session.connected and not session.connect(
             creds, client_id=client_id, timeout_s=PUBLISH_TIMEOUT_SEC
         ):
-            time.sleep(2.0)
+            time.sleep(retry_sleep)
             continue
 
         if not _committed(BOOT_START_SENT):
@@ -632,7 +696,24 @@ def run_service() -> None:
                 else:
                     _release(BOOT_START_SENT)
                     session.close()
-                    time.sleep(2.0)
+                    time.sleep(retry_sleep)
+                    continue
+
+        # Earliest video kick: local MediaMTX cam path, independent of control/gimbal.
+        if not _committed(CAM_READY_SENT) and _cam_ready():
+            fields = _common_fields(creds)
+            fields["cam"] = "ready"
+            payload = format_message("cam_ready", **fields)
+            if _claim(CAM_READY_SENT):
+                if session.publish(
+                    creds.topic_status, payload, timeout_s=PUBLISH_TIMEOUT_SEC
+                ):
+                    _commit(CAM_READY_SENT, payload)
+                    log.info("PI status %s", payload)
+                else:
+                    _release(CAM_READY_SENT)
+                    session.close()
+                    time.sleep(retry_sleep)
                     continue
 
         if BOOT_FINISHED_REQ.is_file() and not _committed(BOOT_FINISHED_SENT):
@@ -642,6 +723,8 @@ def run_service() -> None:
                 extra = {}
             fields = _common_fields(creds)
             fields.update(extra)
+            if fields.get("cam") != "ready" and _cam_ready():
+                fields["cam"] = "ready"
             payload = format_message("boot_finished", **fields)
             if _claim(BOOT_FINISHED_SENT):
                 if session.publish(
@@ -652,17 +735,19 @@ def run_service() -> None:
                 else:
                     _release(BOOT_FINISHED_SENT)
                     session.close()
-                    time.sleep(2.0)
+                    time.sleep(retry_sleep)
                     continue
 
         if now >= next_heartbeat and _committed(BOOT_START_SENT):
             seq += 1
             phase = "up" if _committed(BOOT_FINISHED_SENT) else "boot"
+            fields = _common_fields(creds)
+            fields["cam"] = "ready" if _cam_ready() else "down"
             payload = format_message(
                 "heartbeat",
                 seq=seq,
                 phase=phase,
-                **_common_fields(creds),
+                **fields,
             )
             if session.publish(creds.topic_status, payload, timeout_s=PUBLISH_TIMEOUT_SEC):
                 heartbeat_logs += 1

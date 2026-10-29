@@ -18,8 +18,9 @@ Always-on companion for the ESP32 portal:
 4. **NORMAL_OPERATION** — periodic heartbeats; issues/renews HTTPS certs for MagicDNS
 5. **Pi status** — `rover-pi-status` publishes `PI boot_start` as soon as Wi-Fi
    can reach the broker (it does not wait for `network-online`), then
-   `PI heartbeat` every 5s. `rover-pi-boot-finished` publishes
-   `PI boot_finished` only after the camera path is ready and control is
+   `PI cam_ready` when MediaMTX `cam` is live (iOS should start WHEP here),
+   then `PI heartbeat` every 5s (includes `cam=`). `rover-pi-boot-finished`
+   also emits early `cam_ready`, then `PI boot_finished` once control is
    listening. Idle, manual, factory, and OS halt publish `PI shutdown`
    before the rail drops.
 6. Idle / manual halt (from `rover-control`): writes `/tmp/esp-sleep.req` →

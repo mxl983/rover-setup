@@ -115,9 +115,12 @@ app was offline.
 | Payload | When |
 |---------|------|
 | `PI boot_start …` | First thing after MQTT connects. `boot_ts` is kernel boot time. |
-| `PI heartbeat …` | Every 5s. `phase=boot` until finished, then `phase=up`. `seq` counts. |
-| `PI boot_finished …` | After the camera path is ready and control is accepting connections. |
+| `PI cam_ready cam=ready …` | **Start/retry WHEP now.** MediaMTX `cam` path is live. Do **not** wait for gimbal or `boot_finished`. |
+| `PI heartbeat … [cam=ready\|down]` | Every 5s. `phase=boot` until finished, then `phase=up`. Treat `cam=ready` like `cam_ready` if the dedicated event was missed. |
+| `PI boot_finished …` | Full stack (mediamtx + control + watch). Useful for UI “fully up”; **not** the video gate. |
 | `PI shutdown reason=idle\|manual\|factory\|reboot\|halt` | Before rail-off, or on OS halt/reboot. No further heartbeats. |
+
+Video boot feel: on `PI cam_ready` (or heartbeat `cam=ready`), open WHEP in parallel with control/gimbal. Gimbal coming online later must not delay the first frame.
 
 Boot percentage is the span from `boot_start` / `boot_ts` to `boot_finished`.
 `PI shutdown` means offline until the next `PI boot_start`. A missed heartbeat
