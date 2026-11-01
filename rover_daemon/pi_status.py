@@ -21,14 +21,19 @@ iOS video (WHEP): start/retry as soon as ``PI cam_ready`` (or any heartbeat
 with ``cam=ready``). Do **not** wait for gimbal telemetry or ``boot_finished``.
 ``boot_finished`` means the full control stack is up; cam was often ready
 several seconds earlier.
+
+Broker connect waits until the hostname resolves (or Tailscale yields an IP)
+before opening TLS — same ``PI …`` payloads; no iOS changes required.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -66,9 +71,129 @@ PUBLISH_TIMEOUT_SEC = 8.0
 # Keep trying MQTT after cam is up — Wi-Fi often lags the local stream by a few seconds.
 MQTT_RETRY_SEC = 45.0
 MQTT_RETRY_GAP_SEC = 0.5
+# While broker DNS/Tailscale is down, back off harder (avoid TLS/DNS spam).
+MQTT_WAIT_DNS_GAP_SEC = 1.0
 MEDIAMTX_API = "http://127.0.0.1:9997/v3/paths/get/cam"
 
 _TOKEN_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
+_CONNECT_LOG_GAP_SEC = 5.0
+_last_connect_log_mono = 0.0
+_dns_wait_logged = False
+
+
+def _rate_limited_connect_log(msg: str, *args: object) -> None:
+    global _last_connect_log_mono
+    now = time.monotonic()
+    if now - _last_connect_log_mono < _CONNECT_LOG_GAP_SEC:
+        return
+    _last_connect_log_mono = now
+    log.error(msg, *args)
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address((host or "").strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def _is_tailnet_hostname(host: str) -> bool:
+    h = (host or "").strip().lower().rstrip(".")
+    return h.endswith(".ts.net")
+
+
+def _tailscale_ip4(host: str) -> Optional[str]:
+    """Best-effort MagicDNS → IPv4 via ``tailscale ip`` (works when glibc DNS lags)."""
+    host = (host or "").strip()
+    if not host or _is_ip_literal(host):
+        return None
+    try:
+        proc = subprocess.run(
+            ["tailscale", "ip", "-4", host],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in (proc.stdout or "").splitlines():
+        cand = line.strip()
+        if not cand:
+            continue
+        try:
+            ipaddress.IPv4Address(cand)
+            return cand
+        except ValueError:
+            continue
+    return None
+
+
+def _resolve_broker_ipv4(host: str) -> Optional[str]:
+    """Return an IPv4 for the broker, or None if not ready yet."""
+    host = (host or "").strip()
+    if not host:
+        return None
+    if _is_ip_literal(host):
+        return host.strip("[]")
+    override = os.environ.get("ROVER_MQTT_HOST_IP", "").strip()
+    if override and _is_ip_literal(override):
+        return override.strip("[]")
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+        if infos:
+            return str(infos[0][4][0])
+    except OSError:
+        pass
+    if _is_tailnet_hostname(host):
+        return _tailscale_ip4(host)
+    return None
+
+
+def _broker_endpoint_ready(host: str) -> bool:
+    """True when a TCP target exists — skip MQTT connect attempts until then."""
+    return _resolve_broker_ipv4(host) is not None
+
+
+def _paho_connect_resolved(
+    client,
+    hostname: str,
+    tcp_host: str,
+    port: int,
+    *,
+    keepalive: int = 20,
+) -> None:
+    """Dial ``tcp_host`` while keeping TLS SNI / cert name as ``hostname``.
+
+    paho uses ``self._host`` for both TCP and ``server_hostname``. When only a
+    Tailscale IP is known, temporarily pin ``getaddrinfo(hostname)`` → that IP.
+    """
+    hostname = (hostname or "").strip()
+    tcp_host = (tcp_host or "").strip()
+    if not hostname:
+        raise ValueError("empty MQTT hostname")
+    if not tcp_host or tcp_host == hostname or _is_ip_literal(hostname):
+        client.connect(hostname, int(port), keepalive=keepalive)
+        return
+
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _pinned_getaddrinfo(host, port=None, family=0, type=0, proto=0, flags=0):
+        if host in (hostname, tcp_host):
+            p = 0 if port in (None, "") else int(port)
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", (tcp_host, p)),
+            ]
+        return real_getaddrinfo(host, port, family, type, proto, flags)
+
+    socket.getaddrinfo = _pinned_getaddrinfo  # type: ignore[assignment]
+    try:
+        client.connect(hostname, int(port), keepalive=keepalive)
+    finally:
+        socket.getaddrinfo = real_getaddrinfo  # type: ignore[assignment]
 
 
 def format_message(event: str, **fields: object) -> str:
@@ -323,12 +448,27 @@ class _MqttSession:
         self._connect_err: Optional[BaseException] = None
 
     def connect(self, creds: MqttCreds, *, client_id: str, timeout_s: float) -> bool:
+        global _dns_wait_logged
         self.close()
         host = creds.resolved_host()
         topic = (creds.topic_status or "").strip()
         if not host or not topic:
             log.error("PI status missing mqtt host or topic_status")
             return False
+
+        tcp_host = _resolve_broker_ipv4(host)
+        if not tcp_host:
+            if not _dns_wait_logged:
+                log.info(
+                    "PI status waiting for broker DNS/Tailscale (%s) before MQTT connect",
+                    host,
+                )
+                _dns_wait_logged = True
+            return False
+        if _dns_wait_logged:
+            log.info("PI status broker endpoint ready %s → %s", host, tcp_host)
+            _dns_wait_logged = False
+
         from ._vendor_path import ensure_vendor_path
 
         ensure_vendor_path()
@@ -379,19 +519,24 @@ class _MqttSession:
         client.on_connect = on_connect
         client.on_disconnect = on_disconnect
         client.reconnect_delay_set(min_delay=1, max_delay=30)
+        port = int(creds.resolved_port())
         try:
             client.connect_timeout = max(1.0, min(float(timeout_s), 10.0))
-            client.connect(host, int(creds.resolved_port()), keepalive=20)
+            _paho_connect_resolved(client, host, tcp_host, port, keepalive=20)
             client.loop_start()
         except Exception as exc:
-            log.error("PI status connect %s:%s failed: %s", host, creds.resolved_port(), exc)
+            _rate_limited_connect_log(
+                "PI status connect %s (%s):%s failed: %s", host, tcp_host, port, exc
+            )
             return False
 
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline and not self._connected and self._connect_err is None:
             time.sleep(0.05)
         if self._connect_err is not None or not self._connected:
-            log.error("PI status connect failed: %s", self._connect_err or "timeout")
+            _rate_limited_connect_log(
+                "PI status connect failed: %s", self._connect_err or "timeout"
+            )
             try:
                 client.loop_stop()
                 client.disconnect()
@@ -504,10 +649,33 @@ def publish_cam_ready(creds: Optional[MqttCreds] = None) -> bool:
     return False
 
 
-def _retry_until(publish_fn, *, timeout_s: float, gap_s: float = MQTT_RETRY_GAP_SEC) -> bool:
-    """Call publish_fn until it returns True or the deadline hits."""
+def _retry_until(
+    publish_fn,
+    *,
+    timeout_s: float,
+    gap_s: float = MQTT_RETRY_GAP_SEC,
+    creds: Optional[MqttCreds] = None,
+) -> bool:
+    """Call publish_fn until it returns True or the deadline hits.
+
+    When the broker hostname is not resolvable yet, sleep longer and skip the
+    publish attempt so we do not hammer DNS/TLS before Tailscale is up.
+    """
     deadline = time.monotonic() + max(0.0, timeout_s)
     while True:
+        host = ""
+        if creds is not None:
+            host = creds.resolved_host()
+        else:
+            try:
+                host = mqtt_store.load_effective().resolved_host()
+            except Exception:
+                host = ""
+        if host and not _broker_endpoint_ready(host):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(MQTT_WAIT_DNS_GAP_SEC)
+            continue
         if publish_fn():
             return True
         if time.monotonic() >= deadline:
@@ -593,9 +761,10 @@ def mark_boot_finished() -> bool:
     cam_deadline = time.monotonic() + STACK_WAIT_SEC
     while time.monotonic() < cam_deadline and not _cam_ready():
         time.sleep(0.25)
+    creds = mqtt_store.load_effective()
     if _cam_ready():
         log.info("cam path ready — publishing PI cam_ready for early WHEP")
-        _retry_until(publish_cam_ready, timeout_s=MQTT_RETRY_SEC)
+        _retry_until(lambda: publish_cam_ready(creds), timeout_s=MQTT_RETRY_SEC, creds=creds)
 
     states = wait_for_stack()
     body = " ".join(f"{key}={_token(value)}" for key, value in states.items())
@@ -606,7 +775,11 @@ def mark_boot_finished() -> bool:
         log.warning("could not write %s: %s", BOOT_FINISHED_REQ, exc)
     log.info("boot finished queue %s", body or "(no core units)")
     # Retry until broker reachable — do not exit after one failed publish.
-    return _retry_until(lambda: publish_boot_finished(states), timeout_s=MQTT_RETRY_SEC)
+    return _retry_until(
+        lambda: publish_boot_finished(states, creds),
+        timeout_s=MQTT_RETRY_SEC,
+        creds=creds,
+    )
 
 
 def _parse_state_line(text: str) -> dict[str, str]:
@@ -673,17 +846,28 @@ def run_service() -> None:
 
         # Faster reconnect while video/boot signals are still pending.
         boot_pending = not _committed(BOOT_FINISHED_SENT) or not _committed(CAM_READY_SENT)
-        retry_sleep = 0.5 if boot_pending else 2.0
+        host = creds.resolved_host()
+        dns_ready = (not host) or _broker_endpoint_ready(host)
+        if boot_pending and not dns_ready:
+            retry_sleep = MQTT_WAIT_DNS_GAP_SEC
+        elif boot_pending:
+            retry_sleep = 0.5
+        else:
+            retry_sleep = 2.0
 
         if not creds.has_broker() or not (creds.topic_status or "").strip():
             time.sleep(retry_sleep)
             continue
 
-        if not session.connected and not session.connect(
-            creds, client_id=client_id, timeout_s=PUBLISH_TIMEOUT_SEC
-        ):
-            time.sleep(retry_sleep)
-            continue
+        if not session.connected:
+            if not dns_ready:
+                time.sleep(retry_sleep)
+                continue
+            if not session.connect(
+                creds, client_id=client_id, timeout_s=PUBLISH_TIMEOUT_SEC
+            ):
+                time.sleep(retry_sleep)
+                continue
 
         if not _committed(BOOT_START_SENT):
             payload = format_message("boot_start", **_common_fields(creds))
