@@ -214,6 +214,16 @@ if [[ ! -s "${DROPIN_MQTT}" ]] || ! grep -q '^Environment=' "${DROPIN_MQTT}"; th
 else
   echo "==> Wrote optional MQTT override drop-in ${DROPIN_MQTT}"
 fi
+
+# Always: ESP holds GPIO16 this long after OFF…DELAY so USB root can sync/unmount.
+# (mqtt.json default is also 15; env wins if an old file still says 5.)
+DROPIN_RAIL="${DROPIN_DIR}/rail-off-delay.conf"
+cat >"${DROPIN_RAIL}" <<'EOF'
+[Service]
+Environment=ROVER_MQTT_RAIL_OFF_DELAY=15
+EOF
+echo "==> Wrote ${DROPIN_RAIL} (ROVER_MQTT_RAIL_OFF_DELAY=15)"
+
 mkdir -p /var/lib/rover
 chmod 755 /var/lib/rover
 
